@@ -8,7 +8,11 @@ CONFIG="${CONFIG:-release}"
 APP_NAME="Al"
 APP_DIR="build/${APP_NAME}.app"
 
-./tools/build-whisper.sh
+./tools/download-sherpa.sh
+
+# Guard: ensure sherpa libs exist (catches stale sentinel + partial download)
+SHERPA_LIB="build/sherpa-prefix/lib/libsherpa-onnx-c-api.dylib"
+[[ -f "${SHERPA_LIB}" ]] || { echo "✗ sherpa libs missing — run: tools/download-sherpa.sh --force"; exit 1; }
 
 echo "→ swift build -c ${CONFIG}"
 swift build -c "${CONFIG}"
@@ -18,12 +22,22 @@ BIN_PATH="$(swift build -c "${CONFIG}" --show-bin-path)/${APP_NAME}"
 rm -rf "${APP_DIR}"
 mkdir -p "${APP_DIR}/Contents/MacOS"
 mkdir -p "${APP_DIR}/Contents/Resources"
+mkdir -p "${APP_DIR}/Contents/Frameworks"
 
 cp "${BIN_PATH}" "${APP_DIR}/Contents/MacOS/${APP_NAME}"
 cp Info.plist "${APP_DIR}/Contents/Info.plist"
 
-MODEL_NAME="${WHISPER_MODEL:-ggml-large-v3-turbo-q5_0.bin}"
-cp "build/whisper-models/${MODEL_NAME}" "${APP_DIR}/Contents/Resources/${MODEL_NAME}"
+# Copy sherpa-onnx runtime dylibs (real files only; skip unversioned stubs and symlinks)
+find build/sherpa-prefix/lib -maxdepth 1 -name "*.dylib" ! -type l \
+    ! -name "libonnxruntime.dylib" \
+    | xargs -I{} cp {} "${APP_DIR}/Contents/Frameworks/"
+
+# Patch rpath so the binary finds Frameworks at runtime
+install_name_tool -add_rpath "@executable_path/../Frameworks" \
+    "${APP_DIR}/Contents/MacOS/${APP_NAME}" 2>/dev/null || true
+
+# Bundle sherpa models
+cp -r build/sherpa-models "${APP_DIR}/Contents/Resources/sherpa-models"
 
 if ./tools/make-icon.sh build/icon 2>/dev/null; then
     cp build/icon/icon.icns "${APP_DIR}/Contents/Resources/icon.icns"
