@@ -18,32 +18,23 @@ let package = Package(
             ]
         ),
         .target(
-            name: "CWhisper",
-            path: "Sources/CWhisper",
+            name: "CSherpa",
+            path: "Sources/CSherpa",
             publicHeadersPath: "include",
-            cSettings: [
-                .headerSearchPath("include"),
-            ],
             linkerSettings: [
                 .unsafeFlags([
-                    "-L./build/whisper-prefix/lib",
-                    "-lwhisper",
-                    "-lggml",
-                    "-lggml-base",
-                    "-lggml-cpu",
-                    "-lggml-blas",
-                    "-lggml-metal",
+                    "-L./build/sherpa-prefix/lib",
+                    "-lsherpa-onnx-c-api",
                     "-lc++",
                 ]),
-                .linkedFramework("Metal"),
-                .linkedFramework("MetalKit"),
+                .linkedFramework("CoreML"),
                 .linkedFramework("Foundation"),
                 .linkedFramework("Accelerate"),
             ]
         ),
         .executableTarget(
             name: "Al",
-            dependencies: ["CRNNoise", "CWhisper"],
+            dependencies: ["CRNNoise", "CSherpa"],
             path: "Sources/Al",
             swiftSettings: [
                 .swiftLanguageMode(.v5)
