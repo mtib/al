@@ -143,6 +143,7 @@ final class SherpaEngine {
         silero.min_silence_duration = 0.5
         silero.min_speech_duration  = 0.1
         silero.window_size          = Int32(vadChunkSize)
+        silero.max_speech_duration  = 30.0  // C++ default; 0 causes immediate threshold spike
 
         var vadConfig = SherpaOnnxVadModelConfig()
         vadConfig.silero_vad  = silero

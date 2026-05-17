@@ -92,6 +92,7 @@ final class Pipeline: @unchecked Sendable {
         state = .stopping
         stateLock.unlock()
 
+        Log.line("Pipeline: stopping (caller: \(Thread.callStackSymbols.dropFirst(2).prefix(3).joined(separator: " | ")))")
         heartbeatTask?.cancel()
         heartbeatTask = nil
 
