@@ -3,12 +3,16 @@ import Foundation
 actor TranscriptWriter {
 
     static let rotationIdleSeconds: TimeInterval = 5 * 60
+    /// Gap between utterances above this threshold starts a new line; below it joins with a space.
+    static let newlineGapSeconds: TimeInterval = 3.0
 
     let baseDir: URL
 
     private var handle: FileHandle?
     private var currentFile: URL?
     private var lastEnd: Date?
+    /// True when the write cursor is at the start of a line (nothing written yet, or last char was \n).
+    private var atLineStart: Bool = true
 
     private let dateFolderFormatter: DateFormatter = {
         let f = DateFormatter()
@@ -37,18 +41,20 @@ actor TranscriptWriter {
             Log.line("TranscriptWriter: dropped punctuation-only — \"\(utt.text.prefix(40))\"")
             return
         }
+        let gap = lastEnd.map { utt.startedAt.timeIntervalSince($0) } ?? 0
         do {
             try ensureFile(forUtterance: utt)
-            try writeLine(utt.text)
+            try writeText(utt.text, gap: gap)
             lastEnd = utt.endedAt
         } catch {
             Log.line("TranscriptWriter: write failed — retrying once: \(error.localizedDescription)")
             try? handle?.close()
             handle = nil
             currentFile = nil
+            atLineStart = true
             do {
                 try ensureFile(forUtterance: utt)
-                try writeLine(utt.text)
+                try writeText(utt.text, gap: gap)
                 lastEnd = utt.endedAt
             } catch {
                 Log.line("TranscriptWriter: retry failed — dropping: \"\(utt.text.prefix(40))\"")
@@ -57,10 +63,15 @@ actor TranscriptWriter {
     }
 
     func flush() {
+        // Terminate the last line if we left it open.
+        if !atLineStart, let handle {
+            try? handle.write(contentsOf: Data("\n".utf8))
+        }
         do { try handle?.synchronize() } catch {}
         try? handle?.close()
         handle = nil
         currentFile = nil
+        atLineStart = true
     }
 
     func currentFileURL() -> URL? { currentFile }
@@ -110,15 +121,29 @@ actor TranscriptWriter {
         try h.seekToEnd()
         handle = h
         currentFile = url
+        atLineStart = true
         Log.line("TranscriptWriter: opened \(url.lastPathComponent)")
     }
 
-    private func writeLine(_ text: String) throws {
+    /// Writes `text` with a leading separator chosen by the gap since the last utterance:
+    /// - first on line → no prefix
+    /// - gap < `newlineGapSeconds` → space (join words on the same line)
+    /// - gap ≥ `newlineGapSeconds` → newline (start a fresh line)
+    /// No trailing newline is written; `flush()` closes the last line.
+    private func writeText(_ text: String, gap: TimeInterval) throws {
         guard let handle else {
             throw NSError(domain: "TranscriptWriter", code: -1,
                           userInfo: [NSLocalizedDescriptionKey: "no open file"])
         }
-        let line = (text + "\n").data(using: .utf8) ?? Data()
-        try handle.write(contentsOf: line)
+        let prefix: String
+        if atLineStart {
+            prefix = ""
+        } else if gap >= Self.newlineGapSeconds {
+            prefix = "\n"
+        } else {
+            prefix = " "
+        }
+        try handle.write(contentsOf: Data((prefix + text).utf8))
+        atLineStart = false
     }
 }
