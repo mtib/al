@@ -10,6 +10,14 @@ actor TranscriptWriter {
     private var currentFile: URL?
     private var lastEnd: Date?
 
+    private let dateFolderFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "yyyy-MM-dd"
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.timeZone = .current
+        return f
+    }()
+
     private let stampFormatter: DateFormatter = {
         let f = DateFormatter()
         f.dateFormat = "yyyy-MM-dd'T'HH-mm-ss"
@@ -99,10 +107,11 @@ actor TranscriptWriter {
         handle = nil
         currentFile = nil
 
-        try FileManager.default.createDirectory(at: baseDir, withIntermediateDirectories: true)
+        let dateDir = baseDir.appendingPathComponent(dateFolderFormatter.string(from: utt.startedAt), isDirectory: true)
+        try FileManager.default.createDirectory(at: dateDir, withIntermediateDirectories: true)
 
         let stamp = stampFormatter.string(from: utt.startedAt)
-        var url = baseDir.appendingPathComponent("\(stamp).txt")
+        var url = dateDir.appendingPathComponent("\(stamp).txt")
         var suffix = 0
         while FileManager.default.fileExists(atPath: url.path) {
             suffix += 1
