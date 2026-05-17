@@ -13,7 +13,7 @@ enum Permissions {
         case notDetermined
     }
 
-    /// Synchronous — reads AVCaptureDevice authorization status without prompting.
+    /// Synchronous probe — does NOT prompt.
     static func microphoneStatus() -> Status {
         switch AVCaptureDevice.authorizationStatus(for: .audio) {
         case .authorized:    return .granted
@@ -24,9 +24,8 @@ enum Permissions {
         }
     }
 
-    /// Async — tests SCShareableContent to infer screen-recording grant.
-    /// Returns `.granted` if the call succeeds, `.denied` on SCK permission
-    /// errors, `.notDetermined` otherwise.
+    /// Async probe — does NOT prompt. Tests SCShareableContent to infer
+    /// the screen-recording grant without triggering the system dialog.
     static func screenRecordingStatus() async -> Status {
         do {
             _ = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
@@ -36,5 +35,22 @@ enum Permissions {
         } catch {
             return .notDetermined
         }
+    }
+
+    /// Requests microphone access, showing the system prompt if not yet
+    /// determined. Safe to call when already granted — returns immediately.
+    static func requestMicrophone() async -> Status {
+        let granted = await AVCaptureDevice.requestAccess(for: .audio)
+        return granted ? .granted : .denied
+    }
+
+    /// Requests screen-recording access by triggering an SCShareableContent
+    /// call, which causes macOS to show the Screen Recording prompt when the
+    /// grant is not yet determined. Safe to call when already granted.
+    @discardableResult
+    static func requestScreenRecording() async -> Status {
+        // The SCK call itself is what triggers the system prompt; the return
+        // value is our inferred status from whether it succeeded.
+        return await screenRecordingStatus()
     }
 }

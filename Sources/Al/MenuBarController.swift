@@ -12,6 +12,11 @@ final class MenuBarController: NSObject, NSMenuDelegate {
     private let micPermItem  = NSMenuItem(title: "Microphone: checking…", action: nil, keyEquivalent: "")
     private let sysPermItem  = NSMenuItem(title: "System Audio: checking…", action: nil, keyEquivalent: "")
 
+    // Cached permission state — read synchronously in menuWillOpen so the
+    // menu opens with up-to-date labels without waiting for async work.
+    private var cachedMicStatus: Permissions.Status = .notDetermined
+    private var cachedSysStatus: Permissions.Status = .notDetermined
+
     init(pipeline: Pipeline) {
         self.statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         self.pipeline = pipeline
@@ -19,7 +24,6 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         configureButton()
         buildMenu()
         wireCallbacks()
-        Task { await self.refreshPermissions() }
     }
 
     private func configureButton() {
@@ -85,9 +89,14 @@ final class MenuBarController: NSObject, NSMenuDelegate {
     // MARK: - NSMenuDelegate
 
     func menuWillOpen(_ menu: NSMenu) {
+        // Apply cached state synchronously so the menu opens with current
+        // labels — async updates after this point are too late for this open.
+        applyPermissionCache()
+        // Kick a background refresh so the *next* open (or items still on
+        // screen) shows fresh values.
         Task { @MainActor [weak self] in
             guard let self else { return }
-            await self.refreshPermissions()
+            await self.refreshPermissionCache()
             let url = await self.pipeline.currentFile()
             if let url {
                 self.openCurrentLogItem.title = "Open Current Log (\(url.lastPathComponent))"
@@ -135,13 +144,27 @@ final class MenuBarController: NSObject, NSMenuDelegate {
 
     @objc private func quit() { NSApplication.shared.terminate(nil) }
 
-    // MARK: - Permissions refresh
+    // MARK: - Permissions
 
-    private func refreshPermissions() async {
-        let mic = Permissions.microphoneStatus()
-        micPermItem.title = "Microphone: \(statusLabel(mic))"
-        let sys = await Permissions.screenRecordingStatus()
-        sysPermItem.title = "System Audio: \(statusLabel(sys))"
+    /// Request both permissions (shows system prompts if not yet determined),
+    /// then update the cache and menu items. Called once on launch.
+    func requestAndRefresh() async {
+        cachedMicStatus = await Permissions.requestMicrophone()
+        cachedSysStatus = await Permissions.requestScreenRecording()
+        applyPermissionCache()
+    }
+
+    /// Probe current status without prompting; update cache + menu items.
+    private func refreshPermissionCache() async {
+        cachedMicStatus = Permissions.microphoneStatus()
+        cachedSysStatus = await Permissions.screenRecordingStatus()
+        applyPermissionCache()
+    }
+
+    /// Apply the cached status values to the menu items synchronously.
+    private func applyPermissionCache() {
+        micPermItem.title = "Microphone: \(statusLabel(cachedMicStatus))"
+        sysPermItem.title = "System Audio: \(statusLabel(cachedSysStatus))"
     }
 
     private func statusLabel(_ s: Permissions.Status) -> String {

@@ -8,6 +8,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         Log.line("Al: launched")
         menuBar = MenuBarController(pipeline: pipeline)
+        // Request mic + screen-recording permissions immediately on launch
+        // so the user sees the system prompts right away and the menu bar
+        // shows accurate grant status from the first open.
+        Task { @MainActor in
+            await self.menuBar.requestAndRefresh()
+        }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
