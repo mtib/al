@@ -42,12 +42,22 @@ actor TranscriptWriter {
     /// Returns true when `text` is a known whisper hallucination phrase
     /// (optional leading/trailing punctuation/whitespace) AND no genuine
     /// utterance has been written in the last 15 seconds.
+    private static let stripSet = CharacterSet.whitespacesAndNewlines
+        .union(.punctuationCharacters)
+
+    private func isHallucinationPhrase(_ s: String) -> Bool {
+        let stripped = s.trimmingCharacters(in: Self.stripSet).lowercased()
+        return !stripped.isEmpty && Self.hallucinationPhrases.contains(stripped)
+    }
+
     private func isHallucination(_ text: String) -> Bool {
-        // Strip outer whitespace and punctuation before comparing.
-        let stripped = text.trimmingCharacters(in: .whitespacesAndNewlines
-            .union(.punctuationCharacters))
-            .lowercased()
-        guard Self.hallucinationPhrases.contains(stripped) else { return false }
+        // Split into non-empty lines; the utterance is a hallucination only
+        // when every line is a known hallucination phrase.
+        let lines = text.components(separatedBy: .newlines)
+            .filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
+        guard !lines.isEmpty, lines.allSatisfy({ isHallucinationPhrase($0) }) else {
+            return false
+        }
         // If we have recent real activity, let it through (speaker actually
         // said the phrase in context).
         if let last = lastEnd,
