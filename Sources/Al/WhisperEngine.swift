@@ -48,6 +48,27 @@ final class WhisperEngine {
     private let ctxInitLock = NSLock()
     private let ctxLock = NSLock()
 
+    // MARK: - Pending chunk counter (reference type for safe cross-closure sharing)
+
+    private final class PendingCounter: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value = 0
+
+        func increment() {
+            lock.lock(); value += 1; lock.unlock()
+        }
+
+        /// Decrement and return true if the caller should SKIP processing
+        /// (backlog exceeded max before decrement).
+        func decrementAndShouldSkip(max: Int) -> Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            let overLimit = value > max
+            if value > 0 { value -= 1 }
+            return overLimit
+        }
+    }
+
     // MARK: - Per-source continuity
 
     private var previousChunkTail: [SourceTag: String] = [:]
@@ -140,46 +161,37 @@ final class WhisperEngine {
         continuation: AsyncStream<Utterance>.Continuation
     ) async {
         let (chunkQueue, queueSink) = AsyncStream<ChunkBuffer>.makeStream()
-        let ctxBits = UInt(bitPattern: ctx)
         let tag = source.rawValue
 
         // Pending chunk counter — guards against OOM when worker lags
-        let pendingLock = NSLock()
-        var pendingCount = 0
+        let counter = PendingCounter()
+        let ctxRef = WhisperContextRef(ptr: ctx)
 
         async let accumulate: Void = {
             await self.accumulateChunks(
                 audio: audio,
                 sink: queueSink,
                 source: source,
-                pendingLock: pendingLock,
-                pendingCountPtr: &pendingCount
+                counter: counter
             )
             Log.line("accumulator[\(tag)]: done, closing queue")
             queueSink.finish()
         }()
 
         async let process: Void = {
-            let ptr = OpaquePointer(bitPattern: ctxBits)!
             Log.line("worker[\(tag)]: started")
             for await chunk in chunkQueue {
-                let shouldDrop: Bool = pendingLock.withLock {
-                    let drop = pendingCount > self.maxPendingChunks
-                    if pendingCount > 0 { pendingCount -= 1 }
-                    return drop
-                }
-                if shouldDrop {
-                    Log.line("worker[\(tag)]: ⚠️ dropping chunk #\(chunk.index) — worker backpressure (pendingChunkCount exceeded \(self.maxPendingChunks))")
+                if counter.decrementAndShouldSkip(max: self.maxPendingChunks) {
+                    Log.line("worker[\(tag)]: dropping chunk #\(chunk.index) — worker backpressure (pendingChunkCount exceeded \(self.maxPendingChunks))")
                     continue
                 }
-                if let utterance = await self.processChunk(ctx: ptr, chunk: chunk, source: source) {
+                if let utterance = await self.processChunk(ctx: ctxRef.ptr, chunk: chunk, source: source) {
                     continuation.yield(utterance)
                 }
             }
             Log.line("worker[\(tag)]: queue closed, exiting")
         }()
 
-        // Wrap sink.yield to increment the counter
         _ = await (accumulate, process)
     }
 
@@ -187,8 +199,7 @@ final class WhisperEngine {
         audio: AsyncStream<AVAudioPCMBuffer>,
         sink: AsyncStream<ChunkBuffer>.Continuation,
         source: SourceTag,
-        pendingLock: NSLock,
-        pendingCountPtr: UnsafeMutablePointer<Int>
+        counter: PendingCounter
     ) async {
         let tag = source.rawValue
         let resampler = WhisperResampler()
@@ -304,9 +315,7 @@ final class WhisperEngine {
                     let reason = hitMax ? "max-chunk" : "silence"
                     Log.line("accumulator[\(tag)]: closing chunk #\(chunkIndex) (\(reason)), samples=\(chunkSamples.count), voiced=\(voicedSampleCount)")
 
-                    pendingLock.lock()
-                    pendingCountPtr.pointee += 1
-                    pendingLock.unlock()
+                    counter.increment()
                     sink.yield(ChunkBuffer(
                         samples16k: chunkSamples,
                         voiceStart: voiceStart16k,
@@ -333,9 +342,7 @@ final class WhisperEngine {
         if case .active = state, !chunkSamples.isEmpty, voiceStart16k != nil {
             chunkIndex += 1
             Log.line("accumulator[\(tag)]: stream-end flush, chunk #\(chunkIndex), samples=\(chunkSamples.count)")
-            pendingLock.lock()
-            pendingCountPtr.pointee += 1
-            pendingLock.unlock()
+            counter.increment()
             sink.yield(ChunkBuffer(
                 samples16k: chunkSamples,
                 voiceStart: voiceStart16k,
@@ -410,16 +417,20 @@ final class WhisperEngine {
 
     // MARK: - Whisper helpers
 
+    /// Safe Sendable wrapper for OpaquePointer to avoid bit-cast pattern across task boundaries.
+    private struct WhisperContextRef: @unchecked Sendable {
+        let ptr: OpaquePointer
+    }
+
     private func runWhisperLocked(
         ctx: OpaquePointer,
         samples: [Float],
         initialPrompt: String
     ) async -> [String] {
         let lock = self.ctxLock
-        let ctxBits = UInt(bitPattern: ctx)
+        let ctxRef = WhisperContextRef(ptr: ctx)
         return await Task.detached(priority: .userInitiated) {
-            let ptr = OpaquePointer(bitPattern: ctxBits)!
-            return Self.runWhisperUnderLock(lock: lock, ctx: ptr, samples: samples, initialPrompt: initialPrompt)
+            return Self.runWhisperUnderLock(lock: lock, ctx: ctxRef.ptr, samples: samples, initialPrompt: initialPrompt)
         }.value
     }
 
@@ -485,16 +496,19 @@ final class WhisperEngine {
     // MARK: - Model resolution
 
     private func loadedContext() throws -> OpaquePointer {
+        // Fast path: context already loaded.
         ctxInitLock.lock()
-        defer { ctxInitLock.unlock() }
-        if let c = ctx { return c }
-        if let err = modelLoadError { throw err }
-        // Auto-load if preloadModel() wasn't called explicitly
+        if let c = ctx {
+            ctxInitLock.unlock()
+            return c
+        }
         ctxInitLock.unlock()
+        // Slow path: load it. preloadModel() is idempotent and self-locking.
         try preloadModel()
         ctxInitLock.lock()
+        defer { ctxInitLock.unlock() }
         guard let c = ctx else {
-            throw WhisperEngineError.modelLoadFailed("ctx nil after preloadModel")
+            throw WhisperEngineError.modelNotFound
         }
         return c
     }
@@ -516,11 +530,13 @@ final class WhisperEngine {
 
 enum WhisperEngineError: LocalizedError {
     case modelLoadFailed(String)
+    case modelNotFound
     case whisperFailed(String)
 
     var errorDescription: String? {
         switch self {
         case .modelLoadFailed(let msg): return "WhisperEngine model load failed: \(msg)"
+        case .modelNotFound: return "WhisperEngine: ctx nil after preloadModel"
         case .whisperFailed(let msg): return "whisper_full error: \(msg)"
         }
     }
