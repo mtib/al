@@ -37,7 +37,7 @@ actor TranscriptWriter {
         "thank you", "thanks for watching", "thanks for listening",
         "you're welcome", "music",
     ]
-    private static let hallucinationWindowSeconds: TimeInterval = 15
+    private static let hallucinationWindowSeconds: TimeInterval = 1
 
     /// Returns true when `text` is a known whisper hallucination phrase
     /// (optional leading/trailing punctuation/whitespace) AND no genuine
