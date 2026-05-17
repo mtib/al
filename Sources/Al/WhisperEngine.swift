@@ -30,7 +30,7 @@ final class WhisperEngine {
     // (recent conversation) and minVoicedSecondsQuiet (silence) based on how
     // long ago the last utterance was emitted.
     private let minVoicedSecondsActive: Double = 0.1  // within activeWindow → use this
-    private let minVoicedSecondsQuiet:  Double = 0.8  // beyond quietWindow  → use this
+    private let minVoicedSecondsQuiet:  Double = 0.65 // beyond quietWindow  → use this
     private let activeWindowSeconds:    Double = 5.0  // "still talking" threshold
     private let quietWindowSeconds:     Double = 30.0 // "definitely quiet" threshold
 
