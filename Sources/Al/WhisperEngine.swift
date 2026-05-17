@@ -496,15 +496,18 @@ final class WhisperEngine {
     // MARK: - Model resolution
 
     private func loadedContext() throws -> OpaquePointer {
-        // Fast path: context already loaded.
+        // Fast path: context already loaded (no preloadModel overhead).
         ctxInitLock.lock()
         if let c = ctx {
             ctxInitLock.unlock()
             return c
         }
         ctxInitLock.unlock()
-        // Slow path: load it. preloadModel() is idempotent and self-locking.
+
+        // Slow path: load. preloadModel() is idempotent and owns its own lock.
         try preloadModel()
+
+        // Read back. If preloadModel() succeeded, ctx must be non-nil.
         ctxInitLock.lock()
         defer { ctxInitLock.unlock() }
         guard let c = ctx else {
