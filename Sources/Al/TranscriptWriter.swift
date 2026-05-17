@@ -70,7 +70,22 @@ actor TranscriptWriter {
     // Extracted so tests can override; in production always Date().
     private func utt_clock() -> Date { Date() }
 
+    /// Returns true when every line of `text` contains no word characters —
+    /// i.e. the whole utterance is punctuation/whitespace/brackets only.
+    private func isPunctuationOnly(_ text: String) -> Bool {
+        let lines = text.components(separatedBy: .newlines)
+            .filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
+        guard !lines.isEmpty else { return true }
+        return lines.allSatisfy { line in
+            line.trimmingCharacters(in: Self.stripSet).isEmpty
+        }
+    }
+
     func append(_ utt: Utterance) {
+        if isPunctuationOnly(utt.text) {
+            Log.line("TranscriptWriter: suppressed punctuation-only — \"\(utt.text.prefix(60))\"")
+            return
+        }
         guard !isHallucination(utt.text) else {
             Log.line("TranscriptWriter: suppressed hallucination — \"\(utt.text.prefix(60))\"")
             return

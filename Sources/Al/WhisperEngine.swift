@@ -26,7 +26,27 @@ final class WhisperEngine {
     static let bundledModelName: String = "ggml-large-v3-turbo-q5_0"
 
     private let voiceThreshold: Float = 0.01
-    private let minVoicedSeconds: Double = 0.1   // minimum voiced content before running whisper
+    // Dynamic voiced-sample gate: interpolates between minVoicedSecondsActive
+    // (recent conversation) and minVoicedSecondsQuiet (silence) based on how
+    // long ago the last utterance was emitted.
+    private let minVoicedSecondsActive: Double = 0.1  // within activeWindow → use this
+    private let minVoicedSecondsQuiet:  Double = 0.8  // beyond quietWindow  → use this
+    private let activeWindowSeconds:    Double = 5.0  // "still talking" threshold
+    private let quietWindowSeconds:     Double = 30.0 // "definitely quiet" threshold
+
+    private var lastUtteranceAt: Date? = nil
+    private let lastUtteranceLock = NSLock()
+
+    private func dynamicMinVoicedSeconds() -> Double {
+        let elapsed: TimeInterval = lastUtteranceLock.withLock {
+            guard let last = lastUtteranceAt else { return quietWindowSeconds }
+            return Date().timeIntervalSince(last)
+        }
+        if elapsed <= activeWindowSeconds { return minVoicedSecondsActive }
+        if elapsed >= quietWindowSeconds  { return minVoicedSecondsQuiet  }
+        let t = (elapsed - activeWindowSeconds) / (quietWindowSeconds - activeWindowSeconds)
+        return minVoicedSecondsActive + t * (minVoicedSecondsQuiet - minVoicedSecondsActive)
+    }
     private let onsetSeconds: Double = 0.1
     private let endChunkAfterSilence: Double = 1.0
     private let maxChunkSeconds: Double = 10.0
@@ -40,7 +60,7 @@ final class WhisperEngine {
     private var endChunkSilenceSamples16k: Int { Int(endChunkAfterSilence * 16_000) }
     private var maxChunkSamples16k: Int { Int(maxChunkSeconds * 16_000) }
     private var minChunkSamples16k: Int { Int(minWhisperInputSeconds * 16_000) }
-    private var minVoicedSamples16k: Int { Int(minVoicedSeconds * 16_000) }
+    private var minVoicedSamples16k: Int { Int(dynamicMinVoicedSeconds() * 16_000) }
     private var voicePaddingSamples16k: Int { Int(voicePaddingSeconds * 16_000) }
 
     // MARK: - Shared whisper context
@@ -446,10 +466,12 @@ final class WhisperEngine {
             previousChunkTail[source] = String(joined.suffix(previousChunkTailMaxChars))
         }
 
+        let now = Date()
+        lastUtteranceLock.lock(); lastUtteranceAt = now; lastUtteranceLock.unlock()
         return Utterance(
             source: source,
             startedAt: chunk.firstVoicedWallClock,
-            endedAt: Date(),
+            endedAt: now,
             text: joined
         )
     }
