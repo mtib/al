@@ -69,6 +69,25 @@ final class WhisperEngine {
         }
     }
 
+    // MARK: - Crosstalk suppression
+    // When the system stream carries voiced audio, mic samples are zeroed so
+    // speaker bleed doesn't get transcribed as microphone speech.
+
+    private var lastSystemVoicedAt: Date = .distantPast
+    private let crosstalkLock = NSLock()
+    private let crosstalkPersistSeconds: TimeInterval = 0.25
+
+    private func markSystemVoiced() {
+        let now = Date()
+        crosstalkLock.lock(); lastSystemVoicedAt = now; crosstalkLock.unlock()
+    }
+
+    private func isCrosstalkActive() -> Bool {
+        crosstalkLock.lock()
+        defer { crosstalkLock.unlock() }
+        return Date().timeIntervalSince(lastSystemVoicedAt) < crosstalkPersistSeconds
+    }
+
     // MARK: - Per-source continuity
 
     private var previousChunkTail: [SourceTag: String] = [:]
@@ -235,7 +254,7 @@ final class WhisperEngine {
             }
             bufferCount += 1
 
-            guard let resampled = resampler.convert(buf), !resampled.isEmpty else { continue }
+            guard var resampled = resampler.convert(buf), !resampled.isEmpty else { continue }
 
             // Compute RMS on the original 48 kHz buffer (same as LiveTranslate)
             guard let data = buf.floatChannelData?[0] else { continue }
@@ -243,9 +262,20 @@ final class WhisperEngine {
             var ms: Float = 0
             vDSP_measqv(data, 1, &ms, vDSP_Length(n))
             let rms = sqrt(ms)
-            let voiced = rms >= voiceThreshold
+            var voiced = rms >= voiceThreshold
 
             let frameCount = resampled.count
+
+            // Crosstalk suppression: zero mic samples during system audio activity
+            if source == .mic && isCrosstalkActive() {
+                resampled = [Float](repeating: 0, count: resampled.count)
+                voiced = false
+            }
+
+            // System stream: stamp crosstalk timestamp on voiced frames
+            if source == .system && voiced {
+                markSystemVoiced()
+            }
 
             switch state {
             case .monitoring:
