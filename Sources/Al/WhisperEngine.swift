@@ -26,6 +26,7 @@ final class WhisperEngine {
     static let bundledModelName: String = "ggml-large-v3-turbo-q5_0"
 
     private let voiceThreshold: Float = 0.01
+    private let minVoicedSeconds: Double = 0.1   // minimum voiced content before running whisper
     private let onsetSeconds: Double = 0.1
     private let endChunkAfterSilence: Double = 1.0
     private let maxChunkSeconds: Double = 10.0
@@ -39,6 +40,7 @@ final class WhisperEngine {
     private var endChunkSilenceSamples16k: Int { Int(endChunkAfterSilence * 16_000) }
     private var maxChunkSamples16k: Int { Int(maxChunkSeconds * 16_000) }
     private var minChunkSamples16k: Int { Int(minWhisperInputSeconds * 16_000) }
+    private var minVoicedSamples16k: Int { Int(minVoicedSeconds * 16_000) }
     private var voicePaddingSamples16k: Int { Int(voicePaddingSeconds * 16_000) }
 
     // MARK: - Shared whisper context
@@ -396,6 +398,13 @@ final class WhisperEngine {
 
         guard let voiceStart = chunk.voiceStart else {
             Log.line("worker[\(tag)]: chunk #\(chunk.index) had no voice, skipping")
+            return nil
+        }
+
+        // Gate on minimum voiced content — prevents whisper hallucinating
+        // "Thank you." / "[Music]" on chunks with only a brief noise burst.
+        if chunk.voicedSampleCount < minVoicedSamples16k {
+            Log.line("worker[\(tag)]: chunk #\(chunk.index) too short (voiced=\(chunk.voicedSampleCount) < \(minVoicedSamples16k)), skipping")
             return nil
         }
 
