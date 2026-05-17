@@ -13,6 +13,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // shows accurate grant status from the first open.
         Task { @MainActor in
             await self.menuBar.requestAndRefresh()
+            await self.pipeline.start()
         }
     }
 
