@@ -27,7 +27,7 @@ actor TranscriptWriter {
     /// real content has been written in the last `halluccinationWindowSeconds`.
     private static let hallucinationPhrases: [String] = [
         "thank you", "thanks for watching", "thanks for listening",
-        "you're welcome",
+        "you're welcome", "music",
     ]
     private static let hallucinationWindowSeconds: TimeInterval = 15
 
