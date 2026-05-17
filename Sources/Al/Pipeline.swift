@@ -10,7 +10,7 @@ final class Pipeline: @unchecked Sendable {
 
     private var micSource: DenoisingAudioSource?
     private var systemSource: DenoisingAudioSource?
-    private var engine: WhisperEngine?
+    private var engine: SherpaEngine?
     private let writer = TranscriptWriter()
     private var runGroupTask: Task<Void, Never>?
     private var heartbeatTask: Task<Void, Never>?
@@ -23,7 +23,7 @@ final class Pipeline: @unchecked Sendable {
         state = .starting
         stateLock.unlock()
 
-        let engine = WhisperEngine()
+        let engine = SherpaEngine()
         do {
             try engine.preloadModel()
         } catch {

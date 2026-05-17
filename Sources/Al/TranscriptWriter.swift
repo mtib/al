@@ -31,63 +31,10 @@ actor TranscriptWriter {
         self.baseDir = baseDir
     }
 
-    /// Texts that whisper hallucinates on near-silence — ignored when no
-    /// real content has been written in the last `halluccinationWindowSeconds`.
-    private static let hallucinationPhrases: [String] = [
-        "thank you", "thanks for watching", "thanks for listening",
-        "you're welcome", "music",
-    ]
-    private static let hallucinationWindowSeconds: TimeInterval = 1
-
-    /// Returns true when `text` is a known whisper hallucination phrase
-    /// (optional leading/trailing punctuation/whitespace) AND no genuine
-    /// utterance has been written in the last 15 seconds.
-    private static let stripSet = CharacterSet.whitespacesAndNewlines
-        .union(.punctuationCharacters)
-
-    private func isHallucinationPhrase(_ s: String) -> Bool {
-        let stripped = s.trimmingCharacters(in: Self.stripSet).lowercased()
-        return !stripped.isEmpty && Self.hallucinationPhrases.contains(stripped)
-    }
-
-    private func isHallucination(_ text: String) -> Bool {
-        // Split into non-empty lines; the utterance is a hallucination only
-        // when every line is a known hallucination phrase.
-        let lines = text.components(separatedBy: .newlines)
-            .filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
-        guard !lines.isEmpty, lines.allSatisfy({ isHallucinationPhrase($0) }) else {
-            return false
-        }
-        // If we have recent real activity, let it through (speaker actually
-        // said the phrase in context).
-        if let last = lastEnd,
-           utt_clock().timeIntervalSince(last) < Self.hallucinationWindowSeconds {
-            return false
-        }
-        return true
-    }
-
-    // Extracted so tests can override; in production always Date().
-    private func utt_clock() -> Date { Date() }
-
-    /// Returns true when every line of `text` contains no word characters —
-    /// i.e. the whole utterance is punctuation/whitespace/brackets only.
-    private func isPunctuationOnly(_ text: String) -> Bool {
-        let lines = text.components(separatedBy: .newlines)
-            .filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
-        guard !lines.isEmpty else { return true }
-        return lines.allSatisfy { line in
-            line.trimmingCharacters(in: Self.stripSet).isEmpty
-        }
-    }
-
     func append(_ utt: Utterance) {
-        if isPunctuationOnly(utt.text) {
-            Log.line("TranscriptWriter: suppressed punctuation-only — \"\(utt.text.prefix(60))\"")
-            return
-        }
-        guard !isHallucination(utt.text) else {
-            Log.line("TranscriptWriter: suppressed hallucination — \"\(utt.text.prefix(60))\"")
+        // Drop utterances that are entirely punctuation/whitespace.
+        guard !isPunctuationOnly(utt.text) else {
+            Log.line("TranscriptWriter: dropped punctuation-only — \"\(utt.text.prefix(40))\"")
             return
         }
         do {
@@ -95,7 +42,7 @@ actor TranscriptWriter {
             try writeLine(utt.text)
             lastEnd = utt.endedAt
         } catch {
-            Log.line("TranscriptWriter: write failed: \(error.localizedDescription) — retrying once")
+            Log.line("TranscriptWriter: write failed — retrying once: \(error.localizedDescription)")
             try? handle?.close()
             handle = nil
             currentFile = nil
@@ -104,7 +51,7 @@ actor TranscriptWriter {
                 try writeLine(utt.text)
                 lastEnd = utt.endedAt
             } catch {
-                Log.line("TranscriptWriter: retry failed — dropping utterance: \(utt.text.prefix(40))")
+                Log.line("TranscriptWriter: retry failed — dropping: \"\(utt.text.prefix(40))\"")
             }
         }
     }
@@ -120,6 +67,16 @@ actor TranscriptWriter {
 
     // MARK: - Internals
 
+    private static let stripSet = CharacterSet.whitespacesAndNewlines
+        .union(.punctuationCharacters)
+
+    private func isPunctuationOnly(_ text: String) -> Bool {
+        let lines = text.components(separatedBy: .newlines)
+            .filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
+        guard !lines.isEmpty else { return true }
+        return lines.allSatisfy { $0.trimmingCharacters(in: Self.stripSet).isEmpty }
+    }
+
     private func ensureFile(forUtterance utt: Utterance) throws {
         let needNew: Bool = {
             guard handle != nil, currentFile != nil else { return true }
@@ -132,7 +89,8 @@ actor TranscriptWriter {
         handle = nil
         currentFile = nil
 
-        let dateDir = baseDir.appendingPathComponent(dateFolderFormatter.string(from: utt.startedAt), isDirectory: true)
+        let dateDir = baseDir.appendingPathComponent(
+            dateFolderFormatter.string(from: utt.startedAt), isDirectory: true)
         try FileManager.default.createDirectory(at: dateDir, withIntermediateDirectories: true)
 
         let stamp = stampFormatter.string(from: utt.startedAt)
@@ -144,7 +102,7 @@ actor TranscriptWriter {
                 throw NSError(domain: "TranscriptWriter", code: -2,
                               userInfo: [NSLocalizedDescriptionKey: "too many same-second files"])
             }
-            url = baseDir.appendingPathComponent("\(stamp)-\(suffix).txt")
+            url = dateDir.appendingPathComponent("\(stamp)-\(suffix).txt")
         }
 
         FileManager.default.createFile(atPath: url.path, contents: nil)
