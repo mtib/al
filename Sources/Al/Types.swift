@@ -26,9 +26,9 @@ struct Utterance: Sendable {
     /// Wall-clock time this utterance was produced.
     /// Used by `TranscriptWriter` to name/rotate the output file.
     let startedAt: Date
-    /// Wall-clock time the chunk closed (silence or max-chunk hit).
+    /// Wall-clock time this utterance completed.
     let endedAt: Date
-    /// Joined whisper output for the chunk, trimmed of whitespace.
-    /// Always non-empty (empty results are filtered in WhisperEngine).
+    /// ASR output for the speech segment, trimmed of whitespace.
+    /// Always non-empty (empty results are filtered in SherpaEngine).
     let text: String
 }
