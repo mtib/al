@@ -4,7 +4,8 @@ models/
 .build/
 .swiftpm/
 .DS_Store
-Sources/CWhisper/include/whisper.h
-Sources/CWhisper/include/ggml*.h
 *.xcuserstate
 *.log
+
+# sherpa-onnx generated/downloaded artifacts (not committed)
+Sources/CSherpa/include/c-api.h
