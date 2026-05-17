@@ -1,0 +1,10 @@
+build/
+external/
+models/
+.build/
+.swiftpm/
+.DS_Store
+Sources/CWhisper/include/whisper.h
+Sources/CWhisper/include/ggml*.h
+*.xcuserstate
+*.log
