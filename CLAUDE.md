@@ -41,8 +41,8 @@ scripts. No translation, no UI transcript, no recordings.
 
 Both streams use identical RMS-based VAD chunking in WhisperEngine:
 - `onsetSeconds = 0.1` — chunk only opens after 0.1s of consecutive voiced frames; those frames are included in the chunk
-- `endChunkAfterSilence = 2.0` — close chunk after 2s of silence
-- `maxChunkSeconds = 30.0` — hard cap regardless of silence
+- `endChunkAfterSilence = 1.0` — close chunk after 1s of silence
+- `maxChunkSeconds = 10.0` — hard cap regardless of silence
 - `minWhisperInputSeconds = 1.1` — pad short chunks; drop if zero voice detected
 - Between chunks: RMS monitoring only, no buffer accumulation
 

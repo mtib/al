@@ -27,8 +27,8 @@ final class WhisperEngine {
 
     private let voiceThreshold: Float = 0.01
     private let onsetSeconds: Double = 0.1
-    private let endChunkAfterSilence: Double = 2.0
-    private let maxChunkSeconds: Double = 30.0
+    private let endChunkAfterSilence: Double = 1.0
+    private let maxChunkSeconds: Double = 10.0
     private let minWhisperInputSeconds: Double = 1.1
     private let voicePaddingSeconds: Double = 0.1
     private let previousChunkTailMaxChars: Int = 120
