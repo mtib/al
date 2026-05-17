@@ -23,7 +23,40 @@ actor TranscriptWriter {
         self.baseDir = baseDir
     }
 
+    /// Texts that whisper hallucinates on near-silence — ignored when no
+    /// real content has been written in the last `halluccinationWindowSeconds`.
+    private static let hallucinationPhrases: [String] = [
+        "thank you", "thanks for watching", "thanks for listening",
+        "you're welcome",
+    ]
+    private static let hallucinationWindowSeconds: TimeInterval = 15
+
+    /// Returns true when `text` is a known whisper hallucination phrase
+    /// (optional leading/trailing punctuation/whitespace) AND no genuine
+    /// utterance has been written in the last 15 seconds.
+    private func isHallucination(_ text: String) -> Bool {
+        // Strip outer whitespace and punctuation before comparing.
+        let stripped = text.trimmingCharacters(in: .whitespacesAndNewlines
+            .union(.punctuationCharacters))
+            .lowercased()
+        guard Self.hallucinationPhrases.contains(stripped) else { return false }
+        // If we have recent real activity, let it through (speaker actually
+        // said the phrase in context).
+        if let last = lastEnd,
+           utt_clock().timeIntervalSince(last) < Self.hallucinationWindowSeconds {
+            return false
+        }
+        return true
+    }
+
+    // Extracted so tests can override; in production always Date().
+    private func utt_clock() -> Date { Date() }
+
     func append(_ utt: Utterance) {
+        guard !isHallucination(utt.text) else {
+            Log.line("TranscriptWriter: suppressed hallucination — \"\(utt.text.prefix(60))\"")
+            return
+        }
         do {
             try ensureFile(forUtterance: utt)
             try writeLine(utt.text)
