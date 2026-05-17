@@ -148,7 +148,13 @@ final class WhisperEngine {
         var pendingCount = 0
 
         async let accumulate: Void = {
-            await self.accumulateChunks(audio: audio, sink: queueSink, source: source)
+            await self.accumulateChunks(
+                audio: audio,
+                sink: queueSink,
+                source: source,
+                pendingLock: pendingLock,
+                pendingCountPtr: &pendingCount
+            )
             Log.line("accumulator[\(tag)]: done, closing queue")
             queueSink.finish()
         }()
@@ -180,7 +186,9 @@ final class WhisperEngine {
     private func accumulateChunks(
         audio: AsyncStream<AVAudioPCMBuffer>,
         sink: AsyncStream<ChunkBuffer>.Continuation,
-        source: SourceTag
+        source: SourceTag,
+        pendingLock: NSLock,
+        pendingCountPtr: UnsafeMutablePointer<Int>
     ) async {
         let tag = source.rawValue
         let resampler = WhisperResampler()
@@ -193,6 +201,7 @@ final class WhisperEngine {
         var preActivationBuffer: [Float] = []
         preActivationBuffer.reserveCapacity(onsetSamples16k)
         var consecutiveVoicedSamples: Int = 0
+        var onsetStartWallClock: Date? = nil
 
         // ACTIVE state accumulators
         var chunkSamples: [Float] = []
@@ -230,6 +239,10 @@ final class WhisperEngine {
             switch state {
             case .monitoring:
                 if voiced {
+                    // Capture wall-clock at the first voiced frame of a new potential onset
+                    if consecutiveVoicedSamples == 0 {
+                        onsetStartWallClock = Date()
+                    }
                     // Append to circular pre-activation buffer
                     preActivationBuffer.append(contentsOf: resampled)
                     // Keep only the last onsetSamples16k samples
@@ -242,7 +255,7 @@ final class WhisperEngine {
                     if consecutiveVoicedSamples >= onsetSamples16k {
                         // Transition to ACTIVE — prepend the pre-activation buffer
                         state = .active
-                        firstVoicedWallClock = Date()
+                        firstVoicedWallClock = onsetStartWallClock ?? Date()
 
                         // The pre-activation buffer IS the start of the chunk
                         chunkSamples = preActivationBuffer
@@ -256,6 +269,7 @@ final class WhisperEngine {
                         // Reset pre-activation state
                         preActivationBuffer.removeAll(keepingCapacity: true)
                         consecutiveVoicedSamples = 0
+                        onsetStartWallClock = nil
 
                         Log.line("accumulator[\(tag)]: VAD onset → ACTIVE at chunk #\(chunkIndex + 1) (rms=\(String(format: "%.3f", rms)))")
                     }
@@ -263,6 +277,7 @@ final class WhisperEngine {
                     // Silence in MONITORING — reset onset gate and clear pre-activation buffer
                     consecutiveVoicedSamples = 0
                     preActivationBuffer.removeAll(keepingCapacity: true)
+                    onsetStartWallClock = nil
                 }
 
             case .active:
@@ -289,6 +304,9 @@ final class WhisperEngine {
                     let reason = hitMax ? "max-chunk" : "silence"
                     Log.line("accumulator[\(tag)]: closing chunk #\(chunkIndex) (\(reason)), samples=\(chunkSamples.count), voiced=\(voicedSampleCount)")
 
+                    pendingLock.lock()
+                    pendingCountPtr.pointee += 1
+                    pendingLock.unlock()
                     sink.yield(ChunkBuffer(
                         samples16k: chunkSamples,
                         voiceStart: voiceStart16k,
@@ -315,6 +333,9 @@ final class WhisperEngine {
         if case .active = state, !chunkSamples.isEmpty, voiceStart16k != nil {
             chunkIndex += 1
             Log.line("accumulator[\(tag)]: stream-end flush, chunk #\(chunkIndex), samples=\(chunkSamples.count)")
+            pendingLock.lock()
+            pendingCountPtr.pointee += 1
+            pendingLock.unlock()
             sink.yield(ChunkBuffer(
                 samples16k: chunkSamples,
                 voiceStart: voiceStart16k,
