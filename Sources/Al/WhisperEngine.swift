@@ -456,6 +456,7 @@ final class WhisperEngine {
         params.print_timestamps = false
         params.print_special = false
         params.translate = false
+        params.language = UnsafePointer(strdup("en")) // English-only; skips language detection
         params.no_context = true
         params.single_segment = false
         params.suppress_blank = true
