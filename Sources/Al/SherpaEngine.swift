@@ -15,6 +15,11 @@ import CSherpa
 /// **Shared state:** One `SherpaOnnxOfflineRecognizer` (Moonshine) shared across
 /// both streams, serialised with `recognizerLock`. Each stream owns its own
 /// `SherpaOnnxVoiceActivityDetector` (Silero maintains per-stream state).
+///
+/// **Lifecycle invariant:** `unloadModel()` must only be called after all
+/// `transcribe(audio:source:)` streams have terminated (audio source stopped,
+/// AsyncStream exhausted). The `Pipeline` actor guarantees this by draining
+/// the task group before calling `unloadModel()`.
 final class SherpaEngine {
 
     // MARK: - Constants
@@ -28,7 +33,6 @@ final class SherpaEngine {
 
     private var recognizer: OpaquePointer? // const SherpaOnnxOfflineRecognizer*
     private let recognizerLock = NSLock()
-    private var isLoaded = false
 
     // MARK: - Crosstalk suppression
 
@@ -37,7 +41,9 @@ final class SherpaEngine {
 
     private func markSystemVoiced() {
         let now = Date()
-        crosstalkLock.lock(); lastSystemVoicedAt = now; crosstalkLock.unlock()
+        crosstalkLock.lock()
+        defer { crosstalkLock.unlock() }
+        lastSystemVoicedAt = now
     }
 
     private func isCrosstalkActive() -> Bool {
@@ -53,7 +59,7 @@ final class SherpaEngine {
     func preloadModel() throws {
         recognizerLock.lock()
         defer { recognizerLock.unlock() }
-        guard !isLoaded else { return }
+        guard recognizer == nil else { return }
 
         let modelsDir = Self.resolveModelsDir()
         let moonshineDir = modelsDir.appendingPathComponent("sherpa-onnx-moonshine-base-en-int8")
@@ -82,7 +88,6 @@ final class SherpaEngine {
             throw SherpaEngineError.modelLoadFailed("SherpaOnnxCreateOfflineRecognizer returned nil")
         }
         recognizer = r
-        isLoaded = true
         Log.line("SherpaEngine: model loaded")
     }
 
@@ -92,7 +97,6 @@ final class SherpaEngine {
         if let r = recognizer {
             SherpaOnnxDestroyOfflineRecognizer(r)
             recognizer = nil
-            isLoaded = false
             Log.line("SherpaEngine: model unloaded")
         }
     }
@@ -113,8 +117,8 @@ final class SherpaEngine {
                 }
                 Log.line("SherpaEngine.transcribe[\(source.rawValue)]: starting")
                 await self.runVADLoop(recognizer: rec, audio: audio, source: source, continuation: continuation)
-                Log.line("SherpaEngine.transcribe[\(source.rawValue)]: finished")
                 continuation.finish()
+                Log.line("SherpaEngine.transcribe[\(source.rawValue)]: finished")
             }
         }
     }
@@ -153,7 +157,8 @@ final class SherpaEngine {
         defer { SherpaOnnxDestroyVoiceActivityDetector(vad) }
 
         let resampler = SherpaResampler()
-        var pending: [Float] = []
+        var pendingBuf: [Float] = []
+        var pendingIdx: Int = 0
 
         Log.line("SherpaEngine[\(tag)]: VAD loop started")
 
@@ -169,21 +174,26 @@ final class SherpaEngine {
             // Stamp system voice activity timestamp for crosstalk suppression
             if source == .system, let data = buf.floatChannelData?[0] {
                 let n = Int(buf.frameLength)
-                var ms: Float = 0
-                vDSP_measqv(data, 1, &ms, vDSP_Length(n))
-                if sqrt(ms) >= voiceThreshold { markSystemVoiced() }
+                var meanSquare: Float = 0
+                vDSP_measqv(data, 1, &meanSquare, vDSP_Length(n))
+                if sqrt(meanSquare) >= voiceThreshold { markSystemVoiced() }
             }
 
-            pending.append(contentsOf: samples16k)
+            pendingBuf.append(contentsOf: samples16k)
 
-            // Feed complete 512-sample chunks to Silero
-            while pending.count >= vadChunkSize {
-                let chunk = Array(pending.prefix(vadChunkSize))
-                pending.removeFirst(vadChunkSize)
-                chunk.withUnsafeBufferPointer { ptr in
-                    SherpaOnnxVoiceActivityDetectorAcceptWaveform(vad, ptr.baseAddress, Int32(vadChunkSize))
+            // Feed complete 512-sample chunks to Silero without O(n) copies
+            while pendingBuf.count - pendingIdx >= vadChunkSize {
+                pendingBuf.withUnsafeBufferPointer { ptr in
+                    SherpaOnnxVoiceActivityDetectorAcceptWaveform(
+                        vad, ptr.baseAddress!.advanced(by: pendingIdx), Int32(vadChunkSize))
                 }
+                pendingIdx += vadChunkSize
                 drainSegments(vad: vad, recognizer: recognizer, source: source, continuation: continuation)
+                // Compact when head exceeds a threshold to avoid unbounded growth
+                if pendingIdx > 4096 {
+                    pendingBuf.removeFirst(pendingIdx)
+                    pendingIdx = 0
+                }
             }
         }
 
@@ -218,6 +228,8 @@ final class SherpaEngine {
             if !samplesCopy.isEmpty {
                 if let utt = runASR(recognizer: recognizer, samples: samplesCopy, source: source) {
                     continuation.yield(utt)
+                } else {
+                    Log.line("SherpaEngine[\(source.rawValue)]: segment produced no text (\(samplesCopy.count) samples)")
                 }
             }
         }
