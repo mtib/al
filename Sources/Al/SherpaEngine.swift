@@ -3,16 +3,16 @@ import AVFoundation
 import Accelerate
 import CSherpa
 
-/// Transcription engine using Silero VAD + Moonshine ASR via sherpa-onnx.
+/// Transcription engine using Silero VAD + NeMo Parakeet TDT 0.6B v3 ASR via sherpa-onnx.
 ///
 /// **Pipeline per stream:**
 ///   1. 48 kHz AVAudioPCMBuffer → resample to 16 kHz mono Float32
 ///   2. Crosstalk suppression: mic samples zeroed when system audio voiced within 250 ms
 ///   3. 16 kHz samples fed in 512-sample chunks to a per-stream Silero VAD
-///   4. When Silero signals a complete speech segment, Moonshine ASR runs (CoreML)
+///   4. When Silero signals a complete speech segment, Parakeet ASR runs (CPU)
 ///   5. Non-empty results emitted as Utterance values
 ///
-/// **Shared state:** One `SherpaOnnxOfflineRecognizer` (Moonshine) shared across
+/// **Shared state:** One `SherpaOnnxOfflineRecognizer` (Parakeet) shared across
 /// both streams, serialised with `recognizerLock`. Each stream owns its own
 /// `SherpaOnnxVoiceActivityDetector` (Silero maintains per-stream state).
 ///
@@ -62,28 +62,28 @@ final class SherpaEngine {
         guard recognizer == nil else { return }
 
         let modelsDir = Self.resolveModelsDir()
-        let moonshineDir = modelsDir.appendingPathComponent("sherpa-onnx-moonshine-base-en-int8")
+        let parakeetDir = modelsDir.appendingPathComponent("sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8")
 
         // Keep NSString objects alive across the C call — ARC would otherwise release them.
-        let preprocessorStr = moonshineDir.appendingPathComponent("preprocess.onnx").path as NSString
-        let encoderStr      = moonshineDir.appendingPathComponent("encode.int8.onnx").path as NSString
-        let uncachedStr     = moonshineDir.appendingPathComponent("uncached_decode.int8.onnx").path as NSString
-        let cachedStr       = moonshineDir.appendingPathComponent("cached_decode.int8.onnx").path as NSString
-        let tokensStr       = moonshineDir.appendingPathComponent("tokens.txt").path as NSString
-        let providerStr     = "coreml" as NSString
-        let methodStr       = "greedy_search" as NSString
+        let encoderStr   = parakeetDir.appendingPathComponent("encoder.int8.onnx").path as NSString
+        let decoderStr   = parakeetDir.appendingPathComponent("decoder.int8.onnx").path as NSString
+        let joinerStr    = parakeetDir.appendingPathComponent("joiner.int8.onnx").path as NSString
+        let tokensStr    = parakeetDir.appendingPathComponent("tokens.txt").path as NSString
+        let providerStr  = "coreml" as NSString
+        let methodStr    = "greedy_search" as NSString
+        let modelTypeStr = "nemo_transducer" as NSString
 
         var config = SherpaOnnxOfflineRecognizerConfig()
-        config.model_config.moonshine.preprocessor     = preprocessorStr.utf8String
-        config.model_config.moonshine.encoder          = encoderStr.utf8String
-        config.model_config.moonshine.uncached_decoder = uncachedStr.utf8String
-        config.model_config.moonshine.cached_decoder   = cachedStr.utf8String
-        config.model_config.tokens                     = tokensStr.utf8String
-        config.model_config.provider                   = providerStr.utf8String
-        config.model_config.num_threads                = Int32(max(2, ProcessInfo.processInfo.activeProcessorCount - 2))
-        config.decoding_method                         = methodStr.utf8String
+        config.model_config.transducer.encoder = encoderStr.utf8String
+        config.model_config.transducer.decoder = decoderStr.utf8String
+        config.model_config.transducer.joiner  = joinerStr.utf8String
+        config.model_config.tokens             = tokensStr.utf8String
+        config.model_config.provider           = providerStr.utf8String
+        config.model_config.model_type         = modelTypeStr.utf8String
+        config.model_config.num_threads        = Int32(max(2, ProcessInfo.processInfo.activeProcessorCount - 2))
+        config.decoding_method                 = methodStr.utf8String
 
-        Log.line("SherpaEngine: loading Moonshine model at \(moonshineDir.path)")
+        Log.line("SherpaEngine: loading Parakeet TDT 0.6B v3 model at \(parakeetDir.path)")
         guard let r = SherpaOnnxCreateOfflineRecognizer(&config) else {
             throw SherpaEngineError.modelLoadFailed("SherpaOnnxCreateOfflineRecognizer returned nil")
         }

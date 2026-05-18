@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Download sherpa-onnx pre-built dylibs, Silero VAD model, and Moonshine ASR model.
+# Download sherpa-onnx pre-built dylibs, Silero VAD model, and Parakeet TDT ASR model.
 # Idempotent: skips downloads when sentinel files already exist.
 # Pass --force to re-download everything.
 set -euo pipefail
@@ -51,24 +51,27 @@ else
     echo "✓ silero_vad.onnx already present"
 fi
 
-# --- Moonshine base en int8 ---
-MOONSHINE_DIR="${MODEL_DIR}/sherpa-onnx-moonshine-base-en-int8"
-if [[ "$FORCE" == "--force" ]] || [[ ! -d "${MOONSHINE_DIR}" ]]; then
+# --- NeMo Parakeet TDT 0.6B v3 (int8) ---
+# Drop the old Moonshine model if present so it doesn't get bundled into the app.
+rm -rf "${MODEL_DIR}/sherpa-onnx-moonshine-base-en-int8"
+
+PARAKEET_DIR="${MODEL_DIR}/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8"
+if [[ "$FORCE" == "--force" ]] || [[ ! -d "${PARAKEET_DIR}" ]]; then
     if [[ "$FORCE" == "--force" ]]; then
-        echo "→ forcing re-download of moonshine-base-en-int8…"
-        rm -rf "${MOONSHINE_DIR}"
+        echo "→ forcing re-download of parakeet-tdt-0.6b-v3-int8 (~465 MB)…"
+        rm -rf "${PARAKEET_DIR}"
     else
-        echo "→ downloading moonshine-base-en-int8…"
+        echo "→ downloading parakeet-tdt-0.6b-v3-int8 (~465 MB)…"
     fi
-    rm -rf "${MODEL_DIR}/moonshine-staging"
-    mkdir -p "${MODEL_DIR}/moonshine-staging"
-    curl -fSL "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-moonshine-base-en-int8.tar.bz2" \
-         | tar xj -C "${MODEL_DIR}/moonshine-staging"
-    mv "${MODEL_DIR}/moonshine-staging/sherpa-onnx-moonshine-base-en-int8" "${MOONSHINE_DIR}"
-    rm -rf "${MODEL_DIR}/moonshine-staging"
-    echo "✓ moonshine-base-en-int8 ($(du -sh "${MOONSHINE_DIR}" | cut -f1))"
+    rm -rf "${MODEL_DIR}/parakeet-staging"
+    mkdir -p "${MODEL_DIR}/parakeet-staging"
+    curl -fSL "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8.tar.bz2" \
+         | tar xj -C "${MODEL_DIR}/parakeet-staging"
+    mv "${MODEL_DIR}/parakeet-staging/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8" "${PARAKEET_DIR}"
+    rm -rf "${MODEL_DIR}/parakeet-staging"
+    echo "✓ parakeet-tdt-0.6b-v3-int8 ($(du -sh "${PARAKEET_DIR}" | cut -f1))"
 else
-    echo "✓ moonshine-base-en-int8 already present"
+    echo "✓ parakeet-tdt-0.6b-v3-int8 already present"
 fi
 
 # --- Patch CSherpa forwarding header ---

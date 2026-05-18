@@ -129,7 +129,9 @@ final class MenuBarController: NSObject, NSMenuDelegate {
     }
 
     @objc private func openLogFolder() {
-        let dir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".al")
+        let dir = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Documents")
+            .appendingPathComponent("al")
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         NSWorkspace.shared.open(dir)
     }

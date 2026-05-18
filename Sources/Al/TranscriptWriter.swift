@@ -31,7 +31,8 @@ actor TranscriptWriter {
     }()
 
     init(baseDir: URL = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".al", isDirectory: true)) {
+            .appendingPathComponent("Documents", isDirectory: true)
+            .appendingPathComponent("al", isDirectory: true)) {
         self.baseDir = baseDir
     }
 
