@@ -38,7 +38,9 @@ Click the ear icon in the menu bar:
 
 ## File format
 
-Plain text. One ASR segment per line. No timestamps in the body (the filename is the timestamp). No source tag. Both mic and system audio interleave by arrival time.
+Plain text. No timestamps in the body (the filename is the timestamp). No source tag. Both mic and system audio interleave by arrival time.
+
+ASR segments arriving within **3 seconds** of each other are space-joined on the same line. A new line starts when there is a gap longer than 3 seconds. A new file opens after **5 minutes** of silence.
 
 **Filename:** `~/.al/yyyy-MM-dd/yyyy-MM-ddTHH-mm-ss.txt` — local time, colons replaced with dashes for shell/CLI compatibility.
 
