@@ -171,6 +171,9 @@ final class BrowserViewModel: ObservableObject {
 
     @Published var selectedDocument: ServerDocumentDetail?
     @Published var loadingDetail: Bool = false
+    @Published var copyConfirmation: Bool = false
+
+    private var copyResetTask: Task<Void, Never>?
 
     private static let pageSize = 30
 
@@ -287,9 +290,30 @@ final class BrowserViewModel: ObservableObject {
         return try await AlClient.hybridSearch(trimmed, offset: offset, limit: Self.pageSize)
     }
 
+    /// Copies the document's plain text (space-joined entry text, no timestamps
+    /// or source labels) to the system pasteboard. Flashes a confirmation flag
+    /// that the view resets after a second.
+    func copyDocumentToClipboard(_ doc: ServerDocumentDetail) {
+        let joined = doc.entries
+            .map { $0.text.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+        let pb = NSPasteboard.general
+        pb.clearContents()
+        pb.setString(joined, forType: .string)
+        copyConfirmation = true
+        copyResetTask?.cancel()
+        copyResetTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 1_400_000_000)
+            if !Task.isCancelled { self.copyConfirmation = false }
+        }
+    }
+
     func openDocument(_ hit: ServerDocumentHit) {
         loadingDetail = true
         selectedDocument = nil
+        copyConfirmation = false
+        copyResetTask?.cancel()
         Task {
             do {
                 selectedDocument = try await AlClient.document(hit.doc_id)
@@ -455,16 +479,29 @@ struct BrowserView: View {
 
     private func documentDetail(_ doc: ServerDocumentDetail) -> some View {
         VStack(alignment: .leading, spacing: 0) {
-            VStack(alignment: .leading, spacing: 4) {
-                Text(BrowserViewModel.formatRange(doc.started_at, doc.ended_at))
-                    .font(.headline)
-                HStack(spacing: 6) {
-                    Label("\(doc.entry_count) entries", systemImage: "text.alignleft")
-                    Label(doc.client_ids.count == 1 ? "1 client" : "\(doc.client_ids.count) clients",
-                          systemImage: "person.2.fill")
+            HStack(alignment: .top) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(BrowserViewModel.formatRange(doc.started_at, doc.ended_at))
+                        .font(.headline)
+                    HStack(spacing: 6) {
+                        Label("\(doc.entry_count) entries", systemImage: "text.alignleft")
+                        Label(doc.client_ids.count == 1 ? "1 client" : "\(doc.client_ids.count) clients",
+                              systemImage: "person.2.fill")
+                    }
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
                 }
-                .font(.caption)
-                .foregroundStyle(.secondary)
+                Spacer()
+                Button {
+                    model.copyDocumentToClipboard(doc)
+                } label: {
+                    Label(
+                        model.copyConfirmation ? "Copied" : "Copy",
+                        systemImage: model.copyConfirmation ? "checkmark" : "doc.on.doc"
+                    )
+                }
+                .keyboardShortcut("c", modifiers: [.command, .shift])
+                .help("Copy the full document text (no timestamps) — ⇧⌘C")
             }
             .padding([.horizontal, .top], 12)
 

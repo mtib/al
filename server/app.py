@@ -149,10 +149,30 @@ def _init_schema() -> None:
                 ON entries (client_id, file_id);
             CREATE INDEX IF NOT EXISTS entries_received_at
                 ON entries (received_at);
+            -- Speeds up the time-ordered walk in ingest's document binding
+            -- as well as cross-client merged listings.
+            CREATE INDEX IF NOT EXISTS entries_started_at
+                ON entries (started_at);
 
-            -- Embeddings are keyed by the SHA-256 of the concatenated
-            -- document text so we can reuse a cached vector whenever the
-            -- grouping yields a document with the same content.
+            -- Materialized documents: temporally-contiguous clusters of
+            -- entries across all clients, kept in sync on every ingest.
+            -- See _attach_entry_to_doc / _refresh_doc_metadata.
+            CREATE TABLE IF NOT EXISTS documents (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                started_at  REAL    NOT NULL,
+                ended_at    REAL    NOT NULL,
+                entry_count INTEGER NOT NULL DEFAULT 0,
+                text_hash   TEXT,
+                snippet     TEXT
+            );
+            CREATE INDEX IF NOT EXISTS documents_started_at
+                ON documents (started_at);
+            CREATE INDEX IF NOT EXISTS documents_ended_at
+                ON documents (ended_at);
+
+            -- Embeddings are keyed by the SHA-256 of a document's
+            -- concatenated text so we can reuse a cached vector whenever
+            -- the grouping yields a document with the same content.
             CREATE TABLE IF NOT EXISTS doc_embeddings (
                 text_hash   TEXT    PRIMARY KEY,
                 embedding   BLOB    NOT NULL,
@@ -172,8 +192,124 @@ def _init_schema() -> None:
                 ON server_keys (expires_at);
         """)
 
+        # entries.doc_id is added lazily so an older container can roll
+        # forward without losing data.
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(entries)").fetchall()}
+        if "doc_id" not in cols:
+            log.info("schema: adding entries.doc_id column")
+            conn.execute("ALTER TABLE entries ADD COLUMN doc_id INTEGER")
+        conn.execute("CREATE INDEX IF NOT EXISTS entries_doc_id ON entries(doc_id)")
+
+        # FTS5 mirror of entries.text. `content='entries'` makes it an
+        # external-content table sharing rowids with `entries`. Order is
+        # important here: create the virtual table → backfill it from the
+        # existing entries → only then add the keep-in-sync triggers.
+        # If we created the triggers first, the document-grouping backfill
+        # below would UPDATE entries.doc_id, fire the UPDATE trigger, and
+        # attempt to delete rows from an empty FTS index — that path
+        # corrupts the FTS5 b-tree ("database disk image is malformed").
+        conn.execute("""
+            CREATE VIRTUAL TABLE IF NOT EXISTS entries_fts USING fts5(
+                text,
+                content='entries',
+                content_rowid='rowid',
+                tokenize='unicode61 remove_diacritics 2'
+            )
+        """)
+
+        fts_count = conn.execute("SELECT COUNT(*) FROM entries_fts").fetchone()[0]
+        entries_count = conn.execute("SELECT COUNT(*) FROM entries").fetchone()[0]
+        if fts_count < entries_count:
+            log.info("schema: rebuilding FTS5 mirror (%d entries)", entries_count)
+            conn.execute("INSERT INTO entries_fts(entries_fts) VALUES('rebuild')")
+
+        conn.executescript("""
+            CREATE TRIGGER IF NOT EXISTS entries_fts_ai AFTER INSERT ON entries BEGIN
+              INSERT INTO entries_fts(rowid, text) VALUES (new.rowid, new.text);
+            END;
+            CREATE TRIGGER IF NOT EXISTS entries_fts_ad AFTER DELETE ON entries BEGIN
+              INSERT INTO entries_fts(entries_fts, rowid, text) VALUES('delete', old.rowid, old.text);
+            END;
+            -- Skip the trigger body unless `text` actually changes. The doc-
+            -- binding paths update entries.doc_id constantly; firing the FTS
+            -- delete+insert for that would shred the index for no reason.
+            CREATE TRIGGER IF NOT EXISTS entries_fts_au AFTER UPDATE OF text ON entries BEGIN
+              INSERT INTO entries_fts(entries_fts, rowid, text) VALUES('delete', old.rowid, old.text);
+              INSERT INTO entries_fts(rowid, text) VALUES (new.rowid, new.text);
+            END;
+        """)
+
 
 _init_schema()
+
+
+# ---------- one-time backfills ----------
+
+def _backfill_documents_if_needed() -> None:
+    """Group every entry currently lacking `doc_id` into materialized
+    documents, in time order. Idempotent: only acts when there's something
+    to do."""
+    with db() as conn:
+        pending = conn.execute(
+            "SELECT COUNT(*) FROM entries WHERE doc_id IS NULL"
+        ).fetchone()[0]
+        if pending == 0:
+            return
+        log.info("backfill: assigning documents for %d entries", pending)
+        rows = conn.execute(
+            "SELECT rowid, started_at, ended_at FROM entries "
+            "WHERE doc_id IS NULL ORDER BY started_at, rowid"
+        ).fetchall()
+
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            current_doc_id: Optional[int] = None
+            current_end: float = 0.0
+            touched: set[int] = set()
+            for rowid, started_at, ended_at in rows:
+                # Try to glue onto a pre-existing doc first (handles a
+                # mid-corpus restart cleanly).
+                if current_doc_id is None:
+                    pred = conn.execute(
+                        "SELECT id, ended_at FROM documents "
+                        "WHERE ended_at <= ? ORDER BY ended_at DESC LIMIT 1",
+                        (started_at,),
+                    ).fetchone()
+                    if pred and started_at - pred[1] <= DOCUMENT_GAP_SECONDS:
+                        current_doc_id, current_end = pred[0], pred[1]
+
+                if current_doc_id is None or started_at - current_end > DOCUMENT_GAP_SECONDS:
+                    cur = conn.execute(
+                        "INSERT INTO documents(started_at, ended_at, entry_count) VALUES (?, ?, 0)",
+                        (started_at, ended_at),
+                    )
+                    current_doc_id = int(cur.lastrowid)
+                    current_end = ended_at
+                else:
+                    current_end = max(current_end, ended_at)
+                    conn.execute(
+                        "UPDATE documents SET ended_at = ? WHERE id = ?",
+                        (current_end, current_doc_id),
+                    )
+                conn.execute(
+                    "UPDATE entries SET doc_id = ? WHERE rowid = ?",
+                    (current_doc_id, rowid),
+                )
+                conn.execute(
+                    "UPDATE documents SET entry_count = entry_count + 1 WHERE id = ?",
+                    (current_doc_id,),
+                )
+                touched.add(current_doc_id)
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+
+        for doc_id in touched:
+            _refresh_doc_metadata(conn, doc_id)
+
+
+_backfill_documents_if_needed()
 
 
 # ---------- key rotation ----------
@@ -317,91 +453,287 @@ def _text_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+# ---------- materialized documents ----------
+
+def _refresh_doc_metadata(conn: sqlite3.Connection, doc_id: int) -> None:
+    """Recompute `text_hash`, `snippet`, and `entry_count` for one document
+    by reading its entries in time order. Call after attaching, merging, or
+    extending a document so subsequent reads stay consistent."""
+    rows = conn.execute(
+        "SELECT text FROM entries WHERE doc_id = ? ORDER BY started_at, rowid",
+        (doc_id,),
+    ).fetchall()
+    if not rows:
+        # Empty doc — clean up.
+        conn.execute("DELETE FROM documents WHERE id = ?", (doc_id,))
+        return
+    joined = " ".join((r[0] or "").strip() for r in rows).strip()
+    text_hash = _text_hash(joined) if joined else ""
+    snippet = joined if len(joined) <= 240 else joined[:237] + "..."
+    conn.execute(
+        "UPDATE documents SET text_hash = ?, snippet = ?, entry_count = ? WHERE id = ?",
+        (text_hash, snippet, len(rows), doc_id),
+    )
+
+
+def _attach_entry_to_doc(
+    conn: sqlite3.Connection, rowid: int, started_at: float, ended_at: float
+) -> int:
+    """Bind one new entry to a document, creating or merging as needed.
+
+    The rules mirror the offline grouping the server used to do on every
+    read:
+      - if the entry's time window overlaps an existing doc → attach
+      - if it bridges two docs (gap to predecessor and successor both
+        ≤ DOCUMENT_GAP_SECONDS) → merge them
+      - if it joins only the predecessor or only the successor → extend
+      - otherwise → start a new doc
+
+    Returns the doc_id the entry was attached to. Caller must follow up
+    with `_refresh_doc_metadata(...)` for each doc_id it touched."""
+    gap = DOCUMENT_GAP_SECONDS
+
+    within = conn.execute(
+        "SELECT id, started_at, ended_at FROM documents "
+        "WHERE started_at <= ? AND ended_at >= ? LIMIT 1",
+        (ended_at, started_at),
+    ).fetchone()
+    if within is not None:
+        doc_id = int(within[0])
+        new_start = min(within[1], started_at)
+        new_end = max(within[2], ended_at)
+        if new_start != within[1] or new_end != within[2]:
+            conn.execute(
+                "UPDATE documents SET started_at = ?, ended_at = ? WHERE id = ?",
+                (new_start, new_end, doc_id),
+            )
+        conn.execute("UPDATE entries SET doc_id = ? WHERE rowid = ?", (doc_id, rowid))
+        return doc_id
+
+    pred = conn.execute(
+        "SELECT id, started_at, ended_at FROM documents "
+        "WHERE ended_at < ? ORDER BY ended_at DESC LIMIT 1",
+        (started_at,),
+    ).fetchone()
+    succ = conn.execute(
+        "SELECT id, started_at, ended_at FROM documents "
+        "WHERE started_at > ? ORDER BY started_at ASC LIMIT 1",
+        (ended_at,),
+    ).fetchone()
+    joins_pred = pred is not None and (started_at - pred[2]) <= gap
+    joins_succ = succ is not None and (succ[1] - ended_at) <= gap
+
+    if joins_pred and joins_succ:
+        target_id = int(pred[0])
+        donor_id = int(succ[0])
+        conn.execute(
+            "UPDATE documents SET started_at = ?, ended_at = ? WHERE id = ?",
+            (min(pred[1], started_at), max(succ[2], ended_at), target_id),
+        )
+        # Move every entry from donor → target, then drop donor.
+        conn.execute(
+            "UPDATE entries SET doc_id = ? WHERE doc_id = ?",
+            (target_id, donor_id),
+        )
+        conn.execute("DELETE FROM documents WHERE id = ?", (donor_id,))
+        conn.execute("UPDATE entries SET doc_id = ? WHERE rowid = ?", (target_id, rowid))
+        return target_id
+
+    if joins_pred:
+        doc_id = int(pred[0])
+        conn.execute(
+            "UPDATE documents SET ended_at = ? WHERE id = ? AND ended_at < ?",
+            (ended_at, doc_id, ended_at),
+        )
+        conn.execute("UPDATE entries SET doc_id = ? WHERE rowid = ?", (doc_id, rowid))
+        return doc_id
+
+    if joins_succ:
+        doc_id = int(succ[0])
+        conn.execute(
+            "UPDATE documents SET started_at = ? WHERE id = ? AND started_at > ?",
+            (started_at, doc_id, started_at),
+        )
+        conn.execute("UPDATE entries SET doc_id = ? WHERE rowid = ?", (doc_id, rowid))
+        return doc_id
+
+    cur = conn.execute(
+        "INSERT INTO documents(started_at, ended_at, entry_count) VALUES (?, ?, 0)",
+        (started_at, ended_at),
+    )
+    doc_id = int(cur.lastrowid)
+    conn.execute("UPDATE entries SET doc_id = ? WHERE rowid = ?", (doc_id, rowid))
+    return doc_id
+
+
+def _document_client_ids(conn: sqlite3.Connection, doc_id: int) -> list[str]:
+    rows = conn.execute(
+        "SELECT DISTINCT client_id FROM entries WHERE doc_id = ? ORDER BY client_id",
+        (doc_id,),
+    ).fetchall()
+    return [r[0] for r in rows]
+
+
+def _doc_text(conn: sqlite3.Connection, doc_id: int) -> str:
+    rows = conn.execute(
+        "SELECT text FROM entries WHERE doc_id = ? ORDER BY started_at, rowid",
+        (doc_id,),
+    ).fetchall()
+    return " ".join((r[0] or "").strip() for r in rows).strip()
+
+
+# ---------- FTS5 query helpers ----------
+
+_FTS_SAFE_RE = None  # populated lazily; not really needed because we quote.
+
+
+def _to_fts_match(q: str) -> Optional[str]:
+    """Convert a user query string into a safe FTS5 MATCH expression.
+
+    Splits on whitespace, double-quote-escapes each token, joins with AND.
+    The trailing token gets a `*` prefix wildcard so partial-word queries
+    work mid-type (FTS5's prefix tokens must be alphanumeric). Empty input
+    returns None — the caller should skip the FTS branch."""
+    tokens = [t for t in (q or "").split() if t]
+    if not tokens:
+        return None
+    parts: list[str] = []
+    for i, tok in enumerate(tokens):
+        # Strip characters FTS5 reserves; we then quote the rest to make
+        # punctuation safe to embed.
+        cleaned = "".join(ch for ch in tok if ch.isalnum() or ch in "_'-")
+        if not cleaned:
+            continue
+        safe = cleaned.replace('"', '""')
+        if i == len(tokens) - 1 and cleaned[-1].isalnum():
+            parts.append(f'"{safe}"*')
+        else:
+            parts.append(f'"{safe}"')
+    if not parts:
+        return None
+    return " ".join(parts)
+
+
 class Document:
-    """One temporally-contiguous chunk of entries, merged across clients."""
+    """Lightweight view over a materialized row in the `documents` table."""
 
-    __slots__ = ("started_at", "ended_at", "entries")
+    __slots__ = ("id", "started_at", "ended_at", "entry_count", "text_hash", "snippet", "client_ids")
 
-    def __init__(self, started_at: float, ended_at: float):
+    def __init__(
+        self,
+        id: int,
+        started_at: float,
+        ended_at: float,
+        entry_count: int,
+        text_hash: Optional[str],
+        snippet: Optional[str],
+        client_ids: list[str],
+    ):
+        self.id = id
         self.started_at = started_at
         self.ended_at = ended_at
-        self.entries: list[dict] = []
-
-    @property
-    def text(self) -> str:
-        return " ".join(e["text"] for e in self.entries).strip()
-
-    @property
-    def client_ids(self) -> list[str]:
-        seen: list[str] = []
-        for e in self.entries:
-            if e["client_id"] not in seen:
-                seen.append(e["client_id"])
-        return seen
+        self.entry_count = entry_count
+        self.text_hash = text_hash
+        self.snippet = snippet or ""
+        self.client_ids = client_ids
 
     def to_dict(self) -> dict:
-        text = self.text
-        snippet = text if len(text) <= 240 else text[:237] + "..."
         return {
-            "doc_id": _text_hash(f"{self.started_at:.3f}|{self.ended_at:.3f}|{len(self.entries)}"),
-            "text_hash": _text_hash(text),
+            "doc_id": str(self.id),
+            "text_hash": self.text_hash or "",
             "started_at": self.started_at,
             "ended_at": self.ended_at,
-            "entry_count": len(self.entries),
+            "entry_count": self.entry_count,
             "client_ids": self.client_ids,
-            "snippet": snippet,
+            "snippet": self.snippet,
         }
 
 
-def compute_documents(
+def _load_documents(
     conn: sqlite3.Connection,
+    *,
     client_id: Optional[str] = None,
-    gap_seconds: float = DOCUMENT_GAP_SECONDS,
+    order_desc: bool = True,
+    limit: Optional[int] = None,
+    offset: int = 0,
+    ids: Optional[list[int]] = None,
 ) -> list[Document]:
-    """Walk all entries in time order and group them into documents.
+    """Read materialized documents from the `documents` table.
 
-    A new document starts when the gap between an entry's `started_at` and
-    the running document's `ended_at` exceeds `gap_seconds`. Grouping is
-    cross-client by default — pass `client_id` to scope to one device."""
-    sql = (
-        "SELECT client_id, seq, file_id, source, started_at, ended_at, text "
-        "FROM entries"
-    )
+    When `client_id` is set, restrict to documents that contain at least one
+    entry from that client; we use a sub-select against `entries.doc_id`
+    rather than re-walking the corpus."""
+    where = "1=1"
     args: list = []
     if client_id:
-        sql += " WHERE client_id = ?"
+        where += " AND id IN (SELECT DISTINCT doc_id FROM entries WHERE client_id = ?)"
         args.append(client_id)
-    sql += " ORDER BY started_at"
+    if ids is not None:
+        if not ids:
+            return []
+        placeholders = ",".join(["?"] * len(ids))
+        where += f" AND id IN ({placeholders})"
+        args.extend(ids)
+    direction = "DESC" if order_desc else "ASC"
+    sql = (
+        "SELECT id, started_at, ended_at, entry_count, text_hash, snippet "
+        f"FROM documents WHERE {where} ORDER BY started_at {direction}"
+    )
+    if limit is not None:
+        sql += f" LIMIT {int(limit)} OFFSET {int(offset)}"
     rows = conn.execute(sql, args).fetchall()
+    if not rows:
+        return []
 
-    docs: list[Document] = []
-    current: Optional[Document] = None
-    for cid, seq, fid, src, started, ended, text in rows:
-        if current is None or started - current.ended_at > gap_seconds:
-            if current is not None:
-                docs.append(current)
-            current = Document(started_at=started, ended_at=ended)
-        current.ended_at = max(current.ended_at, ended)
-        current.entries.append({
-            "client_id": cid, "seq": seq, "file_id": fid, "source": src,
-            "started_at": started, "ended_at": ended, "text": text,
-        })
-    if current is not None:
-        docs.append(current)
-    return docs
+    doc_ids = [int(r[0]) for r in rows]
+    # One round-trip to gather distinct client_ids per doc.
+    placeholders = ",".join(["?"] * len(doc_ids))
+    client_map: dict[int, list[str]] = {d: [] for d in doc_ids}
+    for did, cid in conn.execute(
+        f"SELECT doc_id, client_id FROM (SELECT DISTINCT doc_id, client_id FROM entries "
+        f"WHERE doc_id IN ({placeholders})) ORDER BY doc_id, client_id",
+        doc_ids,
+    ).fetchall():
+        client_map.setdefault(int(did), []).append(cid)
+
+    return [
+        Document(
+            id=int(r[0]),
+            started_at=float(r[1]),
+            ended_at=float(r[2]),
+            entry_count=int(r[3]),
+            text_hash=r[4],
+            snippet=r[5],
+            client_ids=client_map.get(int(r[0]), []),
+        )
+        for r in rows
+    ]
 
 
-def _ensure_doc_embedding(conn: sqlite3.Connection, text: str) -> Optional[np.ndarray]:
-    """Return (and cache) the normalized embedding for a document's text."""
+def _ensure_doc_embedding(
+    conn: sqlite3.Connection,
+    doc: Document,
+) -> Optional[np.ndarray]:
+    """Return (and cache) the normalized embedding for a document.
+
+    Looks up by `text_hash` first; if the doc is unembedded (or its hash
+    changed since the last cache write) we re-read its entry text and
+    compute fresh."""
+    if doc.entry_count <= 0:
+        return None
+    h = doc.text_hash or ""
+    if h:
+        row = conn.execute(
+            "SELECT embedding, dim FROM doc_embeddings WHERE text_hash = ?",
+            (h,),
+        ).fetchone()
+        if row is not None:
+            return np.frombuffer(row[0], dtype=np.float32).reshape((row[1],))
+
+    text = _doc_text(conn, doc.id)
     if not text:
         return None
     h = _text_hash(text)
-    row = conn.execute(
-        "SELECT embedding, dim FROM doc_embeddings WHERE text_hash = ?",
-        (h,),
-    ).fetchone()
-    if row is not None:
-        return np.frombuffer(row[0], dtype=np.float32).reshape((row[1],))
     vec = EMBEDDER.encode([text])[0]
     conn.execute(
         """
@@ -410,6 +742,14 @@ def _ensure_doc_embedding(conn: sqlite3.Connection, text: str) -> Optional[np.nd
         """,
         (h, vec.tobytes(), int(vec.shape[0]), time.time()),
     )
+    # If `documents.text_hash` was stale (eg. backfill in progress), pull it
+    # back in sync so future lookups hit the cache cleanly.
+    if doc.text_hash != h:
+        conn.execute(
+            "UPDATE documents SET text_hash = ? WHERE id = ?",
+            (h, doc.id),
+        )
+        doc.text_hash = h
     return vec
 
 
@@ -577,12 +917,17 @@ def ingest(batch: LogBatch) -> IngestAck:
                     (batch.client_id, seq_range[0], seq_range[1]),
                 )
             }
+            touched_docs: set[int] = set()
             conn.execute("BEGIN IMMEDIATE")
             try:
                 for seq, payload in decoded:
                     if seq in existing:
                         continue
-                    conn.execute(
+                    started_at = float(payload.get("started_at", now))
+                    ended_at = float(payload.get("ended_at", started_at))
+                    if ended_at < started_at:
+                        ended_at = started_at
+                    cur = conn.execute(
                         """
                         INSERT INTO entries(client_id, seq, file_id, source, started_at, ended_at, text, received_at)
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -592,12 +937,20 @@ def ingest(batch: LogBatch) -> IngestAck:
                             seq,
                             str(payload.get("file_id", "")),
                             str(payload.get("source", "")),
-                            float(payload.get("started_at", now)),
-                            float(payload.get("ended_at", now)),
+                            started_at,
+                            ended_at,
                             str(payload.get("text", "")),
                             now,
                         ),
                     )
+                    new_rowid = int(cur.lastrowid)
+                    doc_id = _attach_entry_to_doc(conn, new_rowid, started_at, ended_at)
+                    touched_docs.add(doc_id)
+                # Refresh metadata (text_hash, snippet, entry_count) once per
+                # affected doc rather than once per entry — embeddings cache
+                # by text_hash so a stable hash matters.
+                for doc_id in touched_docs:
+                    _refresh_doc_metadata(conn, doc_id)
                 conn.execute("COMMIT")
             except Exception:
                 conn.execute("ROLLBACK")
@@ -618,20 +971,42 @@ def search(
     client_id: Optional[str] = None,
     limit: int = Query(50, ge=1, le=500),
 ) -> SearchResponse:
-    """Plain substring (case-insensitive) search over entry text."""
-    like = f"%{q.lower()}%"
-    sql = (
-        "SELECT client_id, seq, file_id, source, started_at, ended_at, text "
-        "FROM entries WHERE LOWER(text) LIKE ?"
-    )
-    args: list = [like]
-    if client_id:
-        sql += " AND client_id = ?"
-        args.append(client_id)
-    sql += " ORDER BY started_at DESC LIMIT ?"
-    args.append(limit)
+    """Token-level full-text search via SQLite FTS5.
+
+    The user query is sanitized into an FTS5 MATCH expression — each token
+    is quoted and the trailing word gets a `*` so partial-word queries work
+    while typing. Falls back to a plain `LOWER(text) LIKE %q%` scan when
+    the query contains nothing FTS-tokenizable (e.g. only punctuation)."""
+    fts_query = _to_fts_match(q)
     with db() as conn:
-        rows = conn.execute(sql, args).fetchall()
+        if fts_query is not None:
+            sql = (
+                "SELECT entries.client_id, entries.seq, entries.file_id, "
+                "entries.source, entries.started_at, entries.ended_at, entries.text "
+                "FROM entries_fts "
+                "JOIN entries ON entries.rowid = entries_fts.rowid "
+                "WHERE entries_fts MATCH ?"
+            )
+            args: list = [fts_query]
+            if client_id:
+                sql += " AND entries.client_id = ?"
+                args.append(client_id)
+            sql += " ORDER BY entries.started_at DESC LIMIT ?"
+            args.append(limit)
+            rows = conn.execute(sql, args).fetchall()
+        else:
+            like = f"%{q.lower()}%"
+            sql = (
+                "SELECT client_id, seq, file_id, source, started_at, ended_at, text "
+                "FROM entries WHERE LOWER(text) LIKE ?"
+            )
+            args = [like]
+            if client_id:
+                sql += " AND client_id = ?"
+                args.append(client_id)
+            sql += " ORDER BY started_at DESC LIMIT ?"
+            args.append(limit)
+            rows = conn.execute(sql, args).fetchall()
     hits = [
         SearchHit(
             client_id=r[0], seq=r[1], file_id=r[2], source=r[3],
@@ -647,37 +1022,30 @@ def semantic_search(
     q: str = Query(..., min_length=1),
     client_id: Optional[str] = None,
     limit: int = Query(10, ge=1, le=100),
-    gap_seconds: Optional[float] = Query(None, ge=1.0, le=86400.0),
 ) -> DocumentSearchResponse:
-    """Cross-client semantic search.
-
-    The server groups all entries (or one client's, with `client_id=…`) into
-    documents using `gap_seconds` (default `AL_DOCUMENT_GAP_SECONDS`), then
-    ranks documents by cosine similarity to the query."""
-    gap = gap_seconds if gap_seconds is not None else DOCUMENT_GAP_SECONDS
+    """Rank materialized documents by cosine similarity to the query."""
     with db() as conn:
-        docs = compute_documents(conn, client_id=client_id, gap_seconds=gap)
+        docs = _load_documents(conn, client_id=client_id, order_desc=True)
         vecs: list[np.ndarray] = []
-        kept_docs: list[Document] = []
+        kept: list[Document] = []
         for doc in docs:
-            vec = _ensure_doc_embedding(conn, doc.text)
+            vec = _ensure_doc_embedding(conn, doc)
             if vec is None:
                 continue
             vecs.append(vec)
-            kept_docs.append(doc)
+            kept.append(doc)
 
     if not vecs:
         return DocumentSearchResponse(hits=[])
 
     query_vec = EMBEDDER.encode([q])[0]
     matrix = np.vstack(vecs)
-    # Vectors are normalized → cosine == dot product.
     scores = matrix @ query_vec
     top_idx = np.argsort(-scores)[:limit]
 
     hits: list[DocumentHit] = []
     for i in top_idx:
-        doc = kept_docs[int(i)]
+        doc = kept[int(i)]
         d = doc.to_dict()
         d["score"] = float(scores[int(i)])
         hits.append(DocumentHit(**d))
@@ -689,15 +1057,13 @@ def list_documents(
     client_id: Optional[str] = None,
     limit: int = Query(50, ge=1, le=500),
     offset: int = Query(0, ge=0),
-    gap_seconds: Optional[float] = Query(None, ge=1.0, le=86400.0),
 ) -> DocumentListResponse:
-    """Return server-computed documents, newest first, paginated."""
-    gap = gap_seconds if gap_seconds is not None else DOCUMENT_GAP_SECONDS
+    """Return materialized documents, newest first, paginated."""
     with db() as conn:
-        docs = compute_documents(conn, client_id=client_id, gap_seconds=gap)
-    docs.sort(key=lambda d: d.started_at, reverse=True)
-    window = docs[offset:offset + limit]
-    return DocumentListResponse(documents=[DocumentHit(**d.to_dict()) for d in window])
+        docs = _load_documents(
+            conn, client_id=client_id, order_desc=True, limit=limit, offset=offset
+        )
+    return DocumentListResponse(documents=[DocumentHit(**d.to_dict()) for d in docs])
 
 
 @app.get("/search/hybrid", response_model=DocumentSearchResponse, dependencies=[Depends(require_psk)])
@@ -706,21 +1072,42 @@ def hybrid_search(
     client_id: Optional[str] = None,
     limit: int = Query(20, ge=1, le=500),
     offset: int = Query(0, ge=0),
-    gap_seconds: Optional[float] = Query(None, ge=1.0, le=86400.0),
     alpha: float = Query(0.7, ge=0.0, le=1.0),
 ) -> DocumentSearchResponse:
-    """Score each document by a blend of substring frequency and cosine
-    similarity, then return them ranked. `alpha` weights the semantic side;
-    `1 - alpha` weights the textual side. Documents with zero on both
-    signals are dropped."""
-    gap = gap_seconds if gap_seconds is not None else DOCUMENT_GAP_SECONDS
-    needle = q.lower().strip()
+    """Score documents by a blend of FTS5 bm25 and cosine similarity.
+
+    `alpha` weights the semantic side; `1 - alpha` weights the text side.
+    Both scores are min/max-normalized to [0, 1] before mixing so the
+    weighting is meaningful regardless of corpus size. A document needs a
+    positive combined score to be returned."""
+    fts_query = _to_fts_match(q)
     with db() as conn:
-        docs = compute_documents(conn, client_id=client_id, gap_seconds=gap)
+        # Text scores: per-document sum of bm25 across matching entries.
+        # bm25() returns a *negative* relevance value (lower = more
+        # relevant), so we negate it to get a "higher is better" score.
+        text_scores_by_doc: dict[int, float] = {}
+        if fts_query is not None:
+            for did, score in conn.execute(
+                """
+                SELECT entries.doc_id, SUM(-bm25(entries_fts)) AS s
+                FROM entries_fts
+                JOIN entries ON entries.rowid = entries_fts.rowid
+                WHERE entries_fts MATCH ?
+                  AND entries.doc_id IS NOT NULL
+                GROUP BY entries.doc_id
+                """,
+                (fts_query,),
+            ).fetchall():
+                text_scores_by_doc[int(did)] = float(score)
+
+        docs = _load_documents(conn, client_id=client_id, order_desc=True)
+        if not docs:
+            return DocumentSearchResponse(hits=[])
+
         vecs: list[np.ndarray] = []
         kept: list[Document] = []
         for doc in docs:
-            vec = _ensure_doc_embedding(conn, doc.text)
+            vec = _ensure_doc_embedding(conn, doc)
             if vec is None:
                 continue
             vecs.append(vec)
@@ -732,29 +1119,23 @@ def hybrid_search(
     matrix = np.vstack(vecs)
     semantic_scores = matrix @ EMBEDDER.encode([q])[0]
 
-    # Substring frequency, normalized by document length so long files
-    # don't crowd out tight matches.
-    text_scores = np.zeros(len(kept), dtype=np.float32)
-    if needle:
-        for i, doc in enumerate(kept):
-            haystack = doc.text.lower()
-            if not haystack:
-                continue
-            count = haystack.count(needle)
-            if count == 0:
-                continue
-            text_scores[i] = float(count) / max(len(haystack.split()), 1)
+    text_scores = np.array(
+        [text_scores_by_doc.get(d.id, 0.0) for d in kept], dtype=np.float32,
+    )
 
-    # Normalize text scores to [0, 1] so alpha-mixing is meaningful.
-    max_text = float(text_scores.max()) if text_scores.size else 0.0
-    if max_text > 0:
-        text_norm = text_scores / max_text
-    else:
-        text_norm = text_scores
+    # Normalize each axis to [0, 1].
+    def _norm(arr: np.ndarray) -> np.ndarray:
+        lo = float(arr.min()) if arr.size else 0.0
+        hi = float(arr.max()) if arr.size else 0.0
+        if hi - lo < 1e-9:
+            # All equal: keep all zero so this axis has no weight in mixing.
+            return np.zeros_like(arr)
+        return (arr - lo) / (hi - lo)
 
-    combined = alpha * semantic_scores + (1.0 - alpha) * text_norm
+    sem_norm = _norm(semantic_scores)
+    txt_norm = _norm(text_scores)
+    combined = alpha * sem_norm + (1.0 - alpha) * txt_norm
 
-    # Keep anything with any signal — semantic alone is fine.
     mask = combined > 0
     indices = np.where(mask)[0]
     ranked = indices[np.argsort(-combined[indices])]
@@ -770,23 +1151,32 @@ def hybrid_search(
 
 
 @app.get("/document/{doc_id}", dependencies=[Depends(require_psk)])
-def get_document(
-    doc_id: str,
-    client_id: Optional[str] = None,
-    gap_seconds: Optional[float] = Query(None, ge=1.0, le=86400.0),
-) -> dict:
-    """Fetch the full entry list for one server-computed document.
-    Documents are deterministic given the same `gap_seconds` and entry set,
-    so the `doc_id` from a recent `/search/semantic` or `/documents` call
-    will resolve as long as the underlying data hasn't shifted."""
-    gap = gap_seconds if gap_seconds is not None else DOCUMENT_GAP_SECONDS
+def get_document(doc_id: str) -> dict:
+    """Fetch the full entry list for one materialized document."""
+    try:
+        did = int(doc_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="document not found")
     with db() as conn:
-        docs = compute_documents(conn, client_id=client_id, gap_seconds=gap)
-    for doc in docs:
-        d = doc.to_dict()
-        if d["doc_id"] == doc_id:
-            return {**d, "entries": doc.entries}
-    raise HTTPException(status_code=404, detail="document not found")
+        docs = _load_documents(conn, ids=[did])
+        if not docs:
+            raise HTTPException(status_code=404, detail="document not found")
+        doc = docs[0]
+        entry_rows = conn.execute(
+            "SELECT client_id, seq, file_id, source, started_at, ended_at, text "
+            "FROM entries WHERE doc_id = ? ORDER BY started_at, rowid",
+            (did,),
+        ).fetchall()
+    return {
+        **doc.to_dict(),
+        "entries": [
+            {
+                "client_id": r[0], "seq": r[1], "file_id": r[2], "source": r[3],
+                "started_at": r[4], "ended_at": r[5], "text": r[6],
+            }
+            for r in entry_rows
+        ],
+    }
 
 
 @app.get("/recent", dependencies=[Depends(require_psk)])

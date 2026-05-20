@@ -1,0 +1,110 @@
+name: app-release
+
+# Build Al.app and cut a GitHub release whenever the Swift sources, the
+# build script, or the sherpa-onnx download script change on `main`. Pull
+# request runs build the bundle as a smoke test but do not publish.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "Sources/**"
+      - "Package.swift"
+      - "Info.plist"
+      - "build.sh"
+      - "tools/**"
+      - ".github/workflows/app-release.yml"
+  pull_request:
+    paths:
+      - "Sources/**"
+      - "Package.swift"
+      - "Info.plist"
+      - "build.sh"
+      - "tools/**"
+      - ".github/workflows/app-release.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: |
+          sw_vers
+          xcodebuild -version
+          swift --version
+
+      # Cache the sherpa-onnx prebuilt dylibs and the Parakeet/Silero
+      # models — both are deterministic downloads driven by
+      # tools/download-sherpa.sh, so a hash of that script is a good key.
+      - name: Cache sherpa download
+        uses: actions/cache@v4
+        with:
+          path: |
+            build/sherpa-prefix
+            build/sherpa-models
+            Sources/CSherpa/include/c-api.h
+          key: sherpa-${{ runner.os }}-${{ hashFiles('tools/download-sherpa.sh') }}
+
+      - name: Build Al.app (ad-hoc signed)
+        env:
+          # No org signing identity in CI — `-` means ad-hoc, which is fine
+          # for a downloadable bundle. Users will see "unidentified
+          # developer" on first launch.
+          LIVETRANSLATE_SIGN_IDENTITY: "-"
+        run: ./build.sh
+
+      - name: Stage release artifact
+        id: stage
+        run: |
+          set -euo pipefail
+          short_sha="${GITHUB_SHA::7}"
+          stamp="$(date -u +%Y%m%d-%H%M%S)"
+          version="${stamp}-${short_sha}"
+          out="Al-${version}.zip"
+          # `ditto -ck --keepParent` is the macOS-friendly way to produce a
+          # zip that preserves the .app's symlinks and resource forks. A
+          # plain `zip -r` would clobber them and Finder would refuse to
+          # launch the result.
+          ditto -c -k --keepParent build/Al.app "${out}"
+          shasum -a 256 "${out}" > "${out}.sha256"
+          {
+            echo "version=${version}"
+            echo "asset=${out}"
+            echo "asset_sha=${out}.sha256"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Upload build artifact (PRs and dispatch only)
+        if: github.event_name != 'push' || github.ref != 'refs/heads/main'
+        uses: actions/upload-artifact@v4
+        with:
+          name: Al-${{ steps.stage.outputs.version }}
+          path: |
+            ${{ steps.stage.outputs.asset }}
+            ${{ steps.stage.outputs.asset_sha }}
+          retention-days: 14
+
+      - name: Create release
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: app-${{ steps.stage.outputs.version }}
+          name: Al ${{ steps.stage.outputs.version }}
+          body: |
+            Automated build of Al.app from `${{ github.sha }}`.
+
+            * Ad-hoc signed (right-click → Open the first time).
+            * Includes sherpa-onnx Parakeet TDT 0.6B v3 int8 + Silero VAD models.
+            * SHA-256 manifest attached alongside the zip.
+          files: |
+            ${{ steps.stage.outputs.asset }}
+            ${{ steps.stage.outputs.asset_sha }}
+          generate_release_notes: false
+          fail_on_unmatched_files: true
