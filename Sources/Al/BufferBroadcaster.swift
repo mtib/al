@@ -20,8 +20,12 @@ final class BufferBroadcaster {
 
     /// One fresh `AsyncStream` per access. The continuation auto-removes
     /// itself when its consumer task terminates.
+    ///
+    /// Bounded to 200 buffers (~2 s at a 10 ms hardware callback interval).
+    /// If the consumer (ASR) falls behind, the oldest unprocessed buffers
+    /// are dropped — preferable to unbounded memory growth.
     var stream: AsyncStream<AVAudioPCMBuffer> {
-        AsyncStream { cont in
+        AsyncStream(bufferingPolicy: .bufferingNewest(200)) { cont in
             let id = UUID()
             self.lock.withLock { self.listeners[id] = cont }
             cont.onTermination = { [weak self] _ in
