@@ -15,6 +15,9 @@ final class BrowserWindowController {
         if let w = window {
             NSApp.activate(ignoringOtherApps: true)
             w.makeKeyAndOrderFront(nil)
+            // Re-opening a hidden window doesn't fire `.onAppear` on the
+            // SwiftUI root, so we nudge the view to refresh by hand.
+            NotificationCenter.default.post(name: .browserShouldRefresh, object: nil)
             return
         }
         let view = BrowserView()
@@ -29,6 +32,12 @@ final class BrowserWindowController {
         NSApp.activate(ignoringOtherApps: true)
         w.makeKeyAndOrderFront(nil)
     }
+}
+
+extension Notification.Name {
+    /// Posted by `BrowserWindowController.show()` whenever the user opens
+    /// (or re-opens) the Browse window. `BrowserView` listens and reloads.
+    static let browserShouldRefresh = Notification.Name("al.browser.shouldRefresh")
 }
 
 // MARK: - HTTP client
@@ -209,12 +218,6 @@ final class BrowserViewModel: ObservableObject {
         Settings.shared.isShippingConfigured
     }
 
-    func initialLoadIfNeeded() {
-        if results.isEmpty && !loading && errorMessage == nil {
-            reload()
-        }
-    }
-
     /// Called from the search field's onChange — debounces to avoid hammering
     /// the server while the user is mid-typing.
     func queryChanged() {
@@ -353,7 +356,10 @@ struct BrowserView: View {
             }
         }
         .frame(minWidth: 760, minHeight: 460)
-        .onAppear { model.initialLoadIfNeeded() }
+        .onAppear { model.reload() }
+        .onReceive(NotificationCenter.default.publisher(for: .browserShouldRefresh)) { _ in
+            model.reload()
+        }
     }
 
     private var controls: some View {
