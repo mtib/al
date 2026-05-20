@@ -1089,11 +1089,14 @@ def hybrid_search(
         if fts_query is not None:
             for did, score in conn.execute(
                 """
-                SELECT entries.doc_id, SUM(-bm25(entries_fts)) AS s
-                FROM entries_fts
-                JOIN entries ON entries.rowid = entries_fts.rowid
-                WHERE entries_fts MATCH ?
-                  AND entries.doc_id IS NOT NULL
+                SELECT entries.doc_id, SUM(-fts.score) AS s
+                FROM (
+                    SELECT rowid, bm25(entries_fts) AS score
+                    FROM entries_fts
+                    WHERE entries_fts MATCH ?
+                ) AS fts
+                JOIN entries ON entries.rowid = fts.rowid
+                WHERE entries.doc_id IS NOT NULL
                 GROUP BY entries.doc_id
                 """,
                 (fts_query,),
