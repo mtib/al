@@ -1087,21 +1087,22 @@ def hybrid_search(
         # relevant), so we negate it to get a "higher is better" score.
         text_scores_by_doc: dict[int, float] = {}
         if fts_query is not None:
-            for did, score in conn.execute(
-                """
-                SELECT entries.doc_id, SUM(-fts.score) AS s
-                FROM (
-                    SELECT rowid, bm25(entries_fts) AS score
-                    FROM entries_fts
-                    WHERE entries_fts MATCH ?
-                ) AS fts
-                JOIN entries ON entries.rowid = fts.rowid
-                WHERE entries.doc_id IS NOT NULL
-                GROUP BY entries.doc_id
-                """,
+            # bm25() cannot be used in a JOIN context even inside a subquery
+            # when entries_fts is a content table. Fetch rowid+score from the
+            # FTS table alone first, then look up doc_id in a second query.
+            fts_rows = conn.execute(
+                "SELECT rowid, bm25(entries_fts) FROM entries_fts WHERE entries_fts MATCH ?",
                 (fts_query,),
-            ).fetchall():
-                text_scores_by_doc[int(did)] = float(score)
+            ).fetchall()
+            if fts_rows:
+                placeholders = ",".join("?" * len(fts_rows))
+                rowid_to_score = {int(r[0]): float(r[1]) for r in fts_rows}
+                for entry_rowid, doc_id in conn.execute(
+                    f"SELECT rowid, doc_id FROM entries WHERE rowid IN ({placeholders}) AND doc_id IS NOT NULL",
+                    list(rowid_to_score),
+                ).fetchall():
+                    did = int(doc_id)
+                    text_scores_by_doc[did] = text_scores_by_doc.get(did, 0.0) + (-rowid_to_score[int(entry_rowid)])
 
         docs = _load_documents(conn, client_id=client_id, order_desc=True)
         if not docs:
