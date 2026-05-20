@@ -24,16 +24,16 @@ The build script reuses LiveTranslate's signing-identity env var. Al's bundle ID
 
 ## Menu
 
-Click the ear icon in the menu bar:
+Click the ear icon in the menu bar — a popover appears with:
 
 | Item | Behaviour |
 |---|---|
-| _Idle_ / _Running (mic+sys)_ | Decorative status row. |
-| Start / Stop Listening | Toggles the pipeline. Model loads on first Start (~1–2 s). |
+| Status dot + label | Green when running, gray when idle. |
+| Start / Stop Listening | Toggles the pipeline. Model loads on first Start (~5 s on CoreML). |
 | Open Current Log | Opens the file being written in the default text editor. |
-| Open Log Folder | Opens `~/Documents/al/` in Finder (creates it if needed). |
-| Microphone: ✓ / ✗ | TCC status; click to open System Settings → Microphone. |
-| System Audio: ✓ / ✗ | TCC status; click to open System Settings → Screen Recording. |
+| Open Folder | Opens `~/Documents/al/` in Finder (creates it if needed). |
+| Microphone / Screen chips | TCC status with ✓ / ✗ / ?; click to open the relevant pane in System Settings. |
+| Recent transcripts | Scrolling list of the last 200 utterances (auto-scrolls to bottom). Per-line: timestamp, source icon (mic / system audio), text. Text is selectable. |
 | Quit Al | Drains the pipeline, flushes the file, exits. |
 
 ## File format

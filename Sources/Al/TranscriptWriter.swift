@@ -13,6 +13,9 @@ actor TranscriptWriter {
     private var lastEnd: Date?
     /// True when the write cursor is at the start of a line (nothing written yet, or last char was \n).
     private var atLineStart: Bool = true
+    /// When local writing is off, this stands in for the open-file's start time
+    /// so consecutive utterances within the rotation window share a file_id.
+    private var virtualGroupStart: Date?
 
     private let dateFolderFormatter: DateFormatter = {
         let f = DateFormatter()
@@ -36,17 +39,39 @@ actor TranscriptWriter {
         self.baseDir = baseDir
     }
 
-    func append(_ utt: Utterance) {
+    /// Appends one utterance. Returns the stable file_id (e.g.
+    /// `2026-05-20/2026-05-20T14-30-22`) the line was written to, or nil if
+    /// the utterance was filtered out or the write failed entirely.
+    ///
+    /// When local writing is disabled in `Settings`, this skips all file IO
+    /// and just returns a synthetic file_id derived from the same rotation
+    /// logic so the shipper still has a stable grouping key.
+    @discardableResult
+    func append(_ utt: Utterance) async -> String? {
         // Drop utterances that are entirely punctuation/whitespace.
         guard !isPunctuationOnly(utt.text) else {
             Log.line("TranscriptWriter: dropped punctuation-only — \"\(utt.text.prefix(40))\"")
-            return
+            return nil
+        }
+        let writeLocally = await Self.writeLocally()
+        if !writeLocally {
+            // Close any open handle so we don't leak across the toggle flip.
+            if handle != nil {
+                try? handle?.close()
+                handle = nil
+                currentFile = nil
+                atLineStart = true
+            }
+            let fid = virtualFileId(for: utt)
+            lastEnd = utt.endedAt
+            return fid
         }
         let gap = lastEnd.map { utt.startedAt.timeIntervalSince($0) } ?? 0
         do {
             try ensureFile(forUtterance: utt)
             try writeText(utt.text, gap: gap)
             lastEnd = utt.endedAt
+            return fileId(for: currentFile)
         } catch {
             Log.line("TranscriptWriter: write failed — retrying once: \(error.localizedDescription)")
             try? handle?.close()
@@ -57,10 +82,43 @@ actor TranscriptWriter {
                 try ensureFile(forUtterance: utt)
                 try writeText(utt.text, gap: gap)
                 lastEnd = utt.endedAt
+                return fileId(for: currentFile)
             } catch {
                 Log.line("TranscriptWriter: retry failed — dropping: \"\(utt.text.prefix(40))\"")
+                return nil
             }
         }
+    }
+
+    @MainActor
+    private static func writeLocally() -> Bool { Settings.shared.writeLocally }
+
+    /// Mirrors `ensureFile`'s rotation rule (open a fresh group when the
+    /// previous utterance ended more than `rotationIdleSeconds` ago) but
+    /// returns a string instead of opening a file. Cached in
+    /// `virtualGroupStart` so the file_id is stable across the group.
+    private func virtualFileId(for utt: Utterance) -> String {
+        let needsNew: Bool = {
+            guard let groupStart = virtualGroupStart, let last = lastEnd else { return true }
+            _ = groupStart
+            return utt.startedAt.timeIntervalSince(last) > Self.rotationIdleSeconds
+        }()
+        if needsNew {
+            virtualGroupStart = utt.startedAt
+        }
+        let stamp = stampFormatter.string(from: virtualGroupStart ?? utt.startedAt)
+        let date = dateFolderFormatter.string(from: virtualGroupStart ?? utt.startedAt)
+        return "\(date)/\(stamp)"
+    }
+
+    /// `<date>/<stamp>` derived from the URL, e.g. `2026-05-20/2026-05-20T14-30-22`.
+    /// Used by `LogShipper` so the server can group entries the same way the
+    /// client splits them into files.
+    private func fileId(for url: URL?) -> String? {
+        guard let url else { return nil }
+        let stem = url.deletingPathExtension().lastPathComponent
+        let date = url.deletingLastPathComponent().lastPathComponent
+        return "\(date)/\(stem)"
     }
 
     func flush() {

@@ -12,10 +12,15 @@ final class Pipeline: @unchecked Sendable {
     private var systemSource: DenoisingAudioSource?
     private var engine: SherpaEngine?
     private let writer = TranscriptWriter()
+    private let shipper: LogShipper = .shared
     private var runGroupTask: Task<Void, Never>?
     private var heartbeatTask: Task<Void, Never>?
 
     var onStatus: ((String) -> Void)?
+    /// Fires for every utterance after it has been written to disk.
+    /// Invoked from a background task — hop to the main actor before
+    /// touching UI state.
+    var onUtterance: ((Utterance) -> Void)?
 
     func start() async {
         stateLock.lock()
@@ -66,13 +71,19 @@ final class Pipeline: @unchecked Sendable {
 
         let capturedEngine = engine
         let capturedWriter = writer
+        let capturedShipper = shipper
+        let capturedOnUtterance = self.onUtterance
 
         runGroupTask = Task { [weak self] in
             await withTaskGroup(of: Void.self) { group in
                 for (source, tag) in activeSources {
                     group.addTask {
                         for await utt in capturedEngine.transcribe(audio: source.buffers, source: tag) {
-                            await capturedWriter.append(utt)
+                            let fileId = await capturedWriter.append(utt)
+                            // Drop utterances the writer rejected (e.g. punctuation-only).
+                            guard let fileId else { continue }
+                            capturedOnUtterance?(utt)
+                            await capturedShipper.enqueue(fileId: fileId, utterance: utt)
                         }
                     }
                 }

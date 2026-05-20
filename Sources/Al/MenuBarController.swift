@@ -1,28 +1,20 @@
 import AppKit
+import SwiftUI
 
 @MainActor
-final class MenuBarController: NSObject, NSMenuDelegate {
+final class MenuBarController: NSObject, NSPopoverDelegate {
 
     private let statusItem: NSStatusItem
     private let pipeline: Pipeline
-
-    private let statusRow    = NSMenuItem(title: "Idle", action: nil, keyEquivalent: "")
-    private let startStopItem = NSMenuItem(title: "Start Listening", action: nil, keyEquivalent: "")
-    private let openCurrentLogItem = NSMenuItem(title: "Open Current Log", action: nil, keyEquivalent: "")
-    private let micPermItem  = NSMenuItem(title: "Microphone: checking…", action: nil, keyEquivalent: "")
-    private let sysPermItem  = NSMenuItem(title: "System Audio: checking…", action: nil, keyEquivalent: "")
-
-    // Cached permission state — read synchronously in menuWillOpen so the
-    // menu opens with up-to-date labels without waiting for async work.
-    private var cachedMicStatus: Permissions.Status = .notDetermined
-    private var cachedSysStatus: Permissions.Status = .notDetermined
+    private let popover = NSPopover()
+    private let model = MenuBarViewModel()
 
     init(pipeline: Pipeline) {
         self.statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         self.pipeline = pipeline
         super.init()
         configureButton()
-        buildMenu()
+        configurePopover()
         wireCallbacks()
     }
 
@@ -33,46 +25,41 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         img?.isTemplate = true
         button.image = img
         button.toolTip = "Al — Always Listen"
+        button.target = self
+        button.action = #selector(togglePopover)
     }
 
-    private func buildMenu() {
-        let menu = NSMenu()
-        menu.delegate = self
+    private func configurePopover() {
+        let view = MenuBarContentView(
+            model: model,
+            onToggleListening: { [weak self] in self?.toggleListening() },
+            onOpenCurrentLog:  { [weak self] in self?.openCurrentLog() },
+            onOpenLogFolder:   { [weak self] in self?.openLogFolder() },
+            onOpenMicSettings: { [weak self] in self?.openMicSettings() },
+            onOpenScreenSettings: { [weak self] in self?.openScreenSettings() },
+            onOpenOptions:     { [weak self] in self?.openOptions() },
+            onOpenBrowser:     { [weak self] in self?.openBrowser() },
+            onQuit:            { [weak self] in self?.quit() }
+        )
+        popover.contentViewController = NSHostingController(rootView: view)
+        popover.behavior = .transient
+        popover.delegate = self
+    }
 
-        statusRow.isEnabled = false
-        menu.addItem(statusRow)
-        menu.addItem(.separator())
-
-        startStopItem.target = self
-        startStopItem.action = #selector(toggleListening)
-        menu.addItem(startStopItem)
-
-        openCurrentLogItem.target = self
-        openCurrentLogItem.action = #selector(openCurrentLog)
-        openCurrentLogItem.isEnabled = false
-        menu.addItem(openCurrentLogItem)
-
-        let openFolderItem = NSMenuItem(title: "Open Log Folder", action: #selector(openLogFolder), keyEquivalent: "")
-        openFolderItem.target = self
-        menu.addItem(openFolderItem)
-
-        menu.addItem(.separator())
-
-        micPermItem.target = self
-        micPermItem.action = #selector(openMicSettings)
-        menu.addItem(micPermItem)
-
-        sysPermItem.target = self
-        sysPermItem.action = #selector(openScreenSettings)
-        menu.addItem(sysPermItem)
-
-        menu.addItem(.separator())
-
-        let quitItem = NSMenuItem(title: "Quit Al", action: #selector(quit), keyEquivalent: "q")
-        quitItem.target = self
-        menu.addItem(quitItem)
-
-        statusItem.menu = menu
+    @objc private func togglePopover() {
+        guard let button = statusItem.button else { return }
+        if popover.isShown {
+            popover.performClose(nil)
+            return
+        }
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.refreshPermissionCache()
+            self.model.currentLogURL = await self.pipeline.currentFile()
+            self.popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+            // Make the popover key so keyboard shortcuts (Return, Cmd-Q) reach it.
+            self.popover.contentViewController?.view.window?.makeKey()
+        }
     }
 
     private func wireCallbacks() {
@@ -80,37 +67,20 @@ final class MenuBarController: NSObject, NSMenuDelegate {
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 let cap = label.prefix(1).uppercased() + label.dropFirst()
-                self.statusRow.title = String(cap)
-                self.startStopItem.title = label.hasPrefix("running") ? "Stop Listening" : "Start Listening"
+                self.model.statusLabel = String(cap)
+                self.model.isRunning = label.hasPrefix("running")
             }
         }
-    }
-
-    // MARK: - NSMenuDelegate
-
-    func menuWillOpen(_ menu: NSMenu) {
-        // Apply cached state synchronously so the menu opens with current
-        // labels — async updates after this point are too late for this open.
-        applyPermissionCache()
-        // Kick a background refresh so the *next* open (or items still on
-        // screen) shows fresh values.
-        Task { @MainActor [weak self] in
-            guard let self else { return }
-            await self.refreshPermissionCache()
-            let url = await self.pipeline.currentFile()
-            if let url {
-                self.openCurrentLogItem.title = "Open Current Log (\(url.lastPathComponent))"
-                self.openCurrentLogItem.isEnabled = true
-            } else {
-                self.openCurrentLogItem.title = "Open Current Log (none yet)"
-                self.openCurrentLogItem.isEnabled = false
+        pipeline.onUtterance = { [weak self] utt in
+            Task { @MainActor [weak self] in
+                self?.model.append(utt)
             }
         }
     }
 
     // MARK: - Actions
 
-    @objc private func toggleListening() {
+    private func toggleListening() {
         Task { @MainActor in
             switch self.pipeline.state {
             case .running:  await self.pipeline.stop()
@@ -120,7 +90,7 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         }
     }
 
-    @objc private func openCurrentLog() {
+    private func openCurrentLog() {
         Task {
             if let url = await pipeline.currentFile() {
                 NSWorkspace.shared.open(url)
@@ -128,7 +98,7 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         }
     }
 
-    @objc private func openLogFolder() {
+    private func openLogFolder() {
         let dir = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Documents")
             .appendingPathComponent("al")
@@ -136,44 +106,38 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         NSWorkspace.shared.open(dir)
     }
 
-    @objc private func openMicSettings() {
+    private func openMicSettings() {
         NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone")!)
     }
 
-    @objc private func openScreenSettings() {
+    private func openScreenSettings() {
         NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")!)
     }
 
-    @objc private func quit() { NSApplication.shared.terminate(nil) }
+    private func openOptions() {
+        popover.performClose(nil)
+        OptionsWindowController.shared.show()
+    }
+
+    private func openBrowser() {
+        popover.performClose(nil)
+        BrowserWindowController.shared.show()
+    }
+
+    private func quit() { NSApplication.shared.terminate(nil) }
 
     // MARK: - Permissions
 
     /// Request both permissions (shows system prompts if not yet determined),
-    /// then update the cache and menu items. Called once on launch.
+    /// then update the cache. Called once on launch.
     func requestAndRefresh() async {
-        cachedMicStatus = await Permissions.requestMicrophone()
-        cachedSysStatus = await Permissions.requestScreenRecording()
-        applyPermissionCache()
+        model.micStatus = await Permissions.requestMicrophone()
+        model.sysStatus = await Permissions.requestScreenRecording()
     }
 
-    /// Probe current status without prompting; update cache + menu items.
+    /// Probe current status without prompting; update cache.
     private func refreshPermissionCache() async {
-        cachedMicStatus = Permissions.microphoneStatus()
-        cachedSysStatus = await Permissions.screenRecordingStatus()
-        applyPermissionCache()
-    }
-
-    /// Apply the cached status values to the menu items synchronously.
-    private func applyPermissionCache() {
-        micPermItem.title = "Microphone: \(statusLabel(cachedMicStatus))"
-        sysPermItem.title = "System Audio: \(statusLabel(cachedSysStatus))"
-    }
-
-    private func statusLabel(_ s: Permissions.Status) -> String {
-        switch s {
-        case .granted:       return "✓ granted"
-        case .denied:        return "✗ denied — click to open Settings"
-        case .notDetermined: return "not asked yet"
-        }
+        model.micStatus = Permissions.microphoneStatus()
+        model.sysStatus = await Permissions.screenRecordingStatus()
     }
 }
