@@ -1,6 +1,18 @@
 import Foundation
 import SwiftUI
 
+enum ASRModel: String, CaseIterable {
+    case parakeet  = "parakeet"
+    case moonshine = "moonshine"
+
+    var displayName: String {
+        switch self {
+        case .parakeet:  return "Parakeet TDT 0.6B — high quality (~465 MB)"
+        case .moonshine: return "Moonshine Tiny — fast, lighter machines (~45 MB)"
+        }
+    }
+}
+
 /// Observable user-configurable settings. Backed by UserDefaults.
 ///
 /// The pre-shared key (PSK) is stored in UserDefaults in plain text — this is
@@ -17,6 +29,7 @@ final class Settings: ObservableObject {
         static let psk          = "al.server.psk"
         static let clientId     = "al.client.id"
         static let writeLocally = "al.transcript.writeLocally"
+        static let asrModel     = "al.asr.model"
     }
 
     @Published var serverURL: String {
@@ -44,6 +57,14 @@ final class Settings: ObservableObject {
         }
     }
 
+    /// Pipeline restarts when this changes (see MenuBarController).
+    @Published var asrModel: ASRModel {
+        didSet {
+            UserDefaults.standard.set(asrModel.rawValue, forKey: Key.asrModel)
+            NotificationCenter.default.post(name: Settings.didChange, object: self)
+        }
+    }
+
     /// Stable per-install UUID. Generated lazily and never changes after that.
     let clientId: String
 
@@ -51,8 +72,8 @@ final class Settings: ObservableObject {
         let d = UserDefaults.standard
         self.serverURL = d.string(forKey: Key.serverURL) ?? ""
         self.psk = d.string(forKey: Key.psk) ?? ""
-        // Default to true if the key has never been written.
         self.writeLocally = d.object(forKey: Key.writeLocally) as? Bool ?? true
+        self.asrModel = ASRModel(rawValue: d.string(forKey: Key.asrModel) ?? "") ?? .parakeet
         if let existing = d.string(forKey: Key.clientId), !existing.isEmpty {
             self.clientId = existing
         } else {

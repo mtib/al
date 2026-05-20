@@ -22,7 +22,7 @@ final class OptionsWindowController {
         w.title = "Al — Options"
         w.styleMask = [.titled, .closable, .miniaturizable]
         w.isReleasedWhenClosed = false
-        w.setContentSize(NSSize(width: 480, height: 380))
+        w.setContentSize(NSSize(width: 480, height: 440))
         w.center()
         self.window = w
         NSApp.activate(ignoringOtherApps: true)
@@ -39,6 +39,7 @@ final class OptionsViewModel: ObservableObject {
     @Published var serverURL: String
     @Published var psk: String
     @Published var writeLocally: Bool
+    @Published var asrModel: ASRModel
     @Published var testing: Bool = false
     @Published var testResult: TestResult = .idle
     let clientId: String
@@ -72,6 +73,7 @@ final class OptionsViewModel: ObservableObject {
         self.serverURL = s.serverURL
         self.psk = s.psk
         self.writeLocally = s.writeLocally
+        self.asrModel = s.asrModel
         self.clientId = s.clientId
     }
 
@@ -80,6 +82,7 @@ final class OptionsViewModel: ObservableObject {
         s.serverURL = serverURL.trimmingCharacters(in: .whitespacesAndNewlines)
         s.psk = psk
         s.writeLocally = writeLocally
+        s.asrModel = asrModel
     }
 
     func clearShipping() {
@@ -149,6 +152,22 @@ struct OptionsView: View {
                 Text(model.writeLocally
                      ? "Each utterance is appended to a date-bucketed file on disk."
                      : "Disk writes are disabled. Recent lines are still kept in memory and shown in the popover; if a server is configured they're also shipped.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(.bottom, 10)
+
+            Section {
+                Text("Transcription model")
+                    .font(.headline)
+                Picker("ASR model", selection: $model.asrModel) {
+                    ForEach(ASRModel.allCases, id: \.self) { m in
+                        Text(m.displayName).tag(m)
+                    }
+                }
+                .pickerStyle(.radioGroup)
+                Text("Takes effect immediately — the pipeline restarts automatically when you save.")
                     .font(.callout)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
