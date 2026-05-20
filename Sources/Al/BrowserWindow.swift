@@ -313,19 +313,48 @@ final class BrowserViewModel: ObservableObject {
     }
 
     func openDocument(_ hit: ServerDocumentHit) {
-        loadingDetail = true
-        selectedDocument = nil
-        copyConfirmation = false
-        copyResetTask?.cancel()
+        let isSameSelection = selectedDocument?.doc_id == hit.doc_id
+        if !isSameSelection {
+            // Wipe the detail pane only when switching to a different doc so
+            // a re-click on the active row just refreshes in place instead
+            // of flashing the empty state.
+            selectedDocument = nil
+            copyConfirmation = false
+            copyResetTask?.cancel()
+        }
+        loadingDetail = !isSameSelection
         Task {
             do {
-                selectedDocument = try await AlClient.document(hit.doc_id)
+                let fresh = try await AlClient.document(hit.doc_id)
+                // Don't clobber the pane if the user has moved on in the
+                // meantime.
+                if selectedDocument == nil || selectedDocument?.doc_id == hit.doc_id {
+                    selectedDocument = fresh
+                }
             } catch let e as AlServerError {
                 errorMessage = e.localizedDescription
             } catch {
                 errorMessage = error.localizedDescription
             }
             loadingDetail = false
+        }
+    }
+
+    /// Silent re-fetch of the currently selected document. Used by the
+    /// 5-second background ticker — failures are swallowed so a temporarily
+    /// offline server doesn't replace the pane with an error banner.
+    func refreshSelectedDocument() {
+        guard let current = selectedDocument else { return }
+        let docId = current.doc_id
+        Task {
+            do {
+                let fresh = try await AlClient.document(docId)
+                if selectedDocument?.doc_id == docId {
+                    selectedDocument = fresh
+                }
+            } catch {
+                // intentionally silent
+            }
         }
     }
 }
@@ -359,6 +388,17 @@ struct BrowserView: View {
         .onAppear { model.reload() }
         .onReceive(NotificationCenter.default.publisher(for: .browserShouldRefresh)) { _ in
             model.reload()
+        }
+        .task {
+            // Refresh the currently-selected document every 5 s while the
+            // browser is visible. `.task` is cancelled when the view goes
+            // off-screen (window closed/hidden), so we don't poll in the
+            // background.
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 5_000_000_000)
+                if Task.isCancelled { break }
+                model.refreshSelectedDocument()
+            }
         }
     }
 
