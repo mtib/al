@@ -19,16 +19,16 @@ protocol AudioSource: AnyObject {
 }
 
 /// One closed-chunk transcription, ready to write to disk.
-/// Emitted by `WhisperEngine` once per voiced chunk that produced
+/// Emitted by `SherpaEngine` once per speech segment that produced
 /// non-empty text.
 struct Utterance: Sendable {
     let source: SourceTag
-    /// Wall-clock time the first voiced frame in the chunk arrived.
+    /// Wall-clock time this utterance was produced.
     /// Used by `TranscriptWriter` to name/rotate the output file.
     let startedAt: Date
-    /// Wall-clock time the chunk closed (silence or max-chunk hit).
+    /// Wall-clock time this utterance completed.
     let endedAt: Date
-    /// Joined whisper output for the chunk, trimmed of whitespace.
-    /// Always non-empty (empty results are filtered in WhisperEngine).
+    /// ASR output for the speech segment, trimmed of whitespace.
+    /// Always non-empty (empty results are filtered in SherpaEngine).
     let text: String
 }

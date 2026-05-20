@@ -1,10 +1,10 @@
 # Al (Always Listen) — context for Claude
 
 A minimal, no-Xcode macOS menu-bar app that continuously transcribes the
-microphone and system audio (independently) via whisper.cpp and appends
-the resulting text to a rolling log file under `~/.al/`. Sibling project
-to LiveTranslate; reuses its RNNoise wrapper, CWhisper bridge, and build
-scripts. No translation, no UI transcript, no recordings.
+microphone and system audio (independently) via sherpa-onnx (Silero VAD +
+NeMo Parakeet TDT 0.6B v3 int8 ASR) and appends the resulting text to a
+rolling log file under `~/Documents/al/`. No translation, no UI transcript, no
+recordings.
 
 > **Process rule for future edits**
 >
@@ -14,37 +14,42 @@ scripts. No translation, no UI transcript, no recordings.
 
 ## How it's built
 
-- Pure SwiftPM + CMake for whisper.cpp (no Xcode). Same toolchain as
-  LiveTranslate.
-- `./build.sh` runs `tools/build-whisper.sh`, then `swift build -c release`,
-  then wraps the binary into `build/Al.app/`, copies the GGML model into
-  Resources, and codesigns. Use:
+- Pure SwiftPM + pre-built sherpa-onnx dylibs (no Xcode, no CMake).
+- `./build.sh` runs `tools/download-sherpa.sh` (idempotent download of
+  sherpa-onnx dylibs + models), then `swift build -c release`, then wraps
+  the binary into `build/Al.app/`. Use:
   ```sh
   LIVETRANSLATE_SIGN_IDENTITY=LiveTranslateDev ./build.sh
   ```
-  to reuse the existing self-signed cert (keeps TCC grants across rebuilds).
+  Reusing the same signing identity keeps TCC grants valid across rebuilds
+  (grants are keyed on cert identity + bundle ID).
 - Launch via `open build/Al.app` — never run the binary directly.
 
 ## Architecture
 
-```
-  Mic ────▶ RNNoise(mic) ───▶ WhisperEngine.transcribe(.mic) ──┐
-                                                                ├─▶ TranscriptWriter
-  System ─▶ RNNoise(sys) ───▶ WhisperEngine.transcribe(.system) ┘   (~/.al/<stamp>.txt,
-                                                                     5-min rotation)
-                                              ▲
-                                              │ shared whisper_context
-                                              │ (NSLock around whisper_full)
+```mermaid
+flowchart TD
+    Mic[Mic] --> MicDenoise[RNNoise]
+    Sys[System audio] --> SysDenoise[RNNoise]
+    MicDenoise --> Engine[SherpaEngine<br>Silero VAD per-stream<br>Parakeet TDT 0.6B v3 ASR shared]
+    SysDenoise --> Engine
+    Engine --> Writer[TranscriptWriter<br>~/Documents/al/&lt;yyyy-MM-dd&gt;/&lt;stamp&gt;.txt<br>5-min idle rotation]
+    Writer -. optional .-> Shipper[LogShipper<br>X25519 sealed-box envelope<br>JSONL outbox + worker loop]
+    Shipper -- HTTPS<br>Authorization: Bearer PSK --> Server[server/<br>SQLite + sentence-transformers]
 ```
 
-## VAD Chunking Rules
+## VAD / ASR
 
-Both streams use identical RMS-based VAD chunking in WhisperEngine:
-- `onsetSeconds = 0.1` — chunk only opens after 0.1s of consecutive voiced frames; those frames are included in the chunk
-- `endChunkAfterSilence = 1.0` — close chunk after 1s of silence
-- `maxChunkSeconds = 10.0` — hard cap regardless of silence
-- `minWhisperInputSeconds = 1.1` — pad short chunks; drop if zero voice detected
-- Between chunks: RMS monitoring only, no buffer accumulation
+Both streams use Silero VAD (sherpa-onnx, 512-sample chunks at 16 kHz):
+- `threshold = 0.5` — speech probability threshold
+- `min_silence_duration = 1.5s` — closes segment after 1.5 s of silence
+- `min_speech_duration = 0.1s` — ignores noise bursts < 100 ms
+
+ASR: NeMo Parakeet TDT 0.6B v3 int8 (ONNX, ~600 MB unpacked), English-only,
+CoreML provider (Metal/ANE acceleration on Apple Silicon). Higher accuracy
+than Moonshine base, ~4× larger model. If CoreML EP throws on an op,
+recognizer init crashes the app at startup — fall back to `provider = "cpu"`
+in `SherpaEngine.preloadModel()` and confirm in `/tmp/al.log`.
 
 ## Files
 
@@ -52,34 +57,65 @@ Both streams use identical RMS-based VAD chunking in WhisperEngine:
 |---|---|
 | `main.swift` | NSApplicationMain bootstrap; sets `.accessory` activation policy (no Dock icon). |
 | `AppDelegate.swift` | Lifecycle owner. Holds `Pipeline` and `MenuBarController`. Drains pipeline on termination. |
-| `MenuBarController.swift` | `NSStatusItem` with ear.fill SF Symbol. Menu: start/stop, open log, permissions shortcuts, quit. Refreshes permission status on every menu open. |
-| `Pipeline.swift` | Top-level orchestrator. Wires sources→denoiser→engine→writer. Owns hourly RSS heartbeat. Shutdown: stop sources → await task group drain → flush writer → unload model. |
+| `MenuBarController.swift` | NSStatusItem with ear.fill SF Symbol. Click opens an `NSPopover` (behavior `.transient`) hosting `MenuBarContentView` via `NSHostingController`. Owns `MenuBarViewModel` and bridges Pipeline callbacks → `@MainActor` state mutations. |
+| `MenuBarContentView.swift` | SwiftUI popover content: status row, Start/Stop + log buttons, permission chips, a scrolling live transcript list (last 200 utterances, auto-scroll to bottom), Options…, Quit. `MenuBarViewModel` is `ObservableObject`; the on-disk transcript remains the source of truth. |
+| `OptionsWindow.swift` | Singleton `NSWindowController` + SwiftUI form for the local-transcripts toggle, log-shipping server URL, and pre-shared key. Includes a Test Connection button that hits `GET /pubkey`. |
+| `BrowserWindow.swift` | Singleton `NSWindowController` + SwiftUI browser. Talks to the configured server via `AlClient` (`/search`, `/search/semantic`, `/documents`, `/document/{id}`). Hidden if shipping isn't configured. |
+| `Settings.swift` | `@MainActor ObservableObject` wrapping `UserDefaults` for `serverURL`, `psk`, `writeLocally` (default true), and a stable per-install `clientId` (UUID). Posts `Settings.didChange` on save. |
+| `Crypto.swift` | X25519 sealed-box wrapper using CryptoKit: ephemeral keypair + HKDF-SHA256 + ChaCha20-Poly1305. Wire format documented in the file header. |
+| `LogShipper.swift` | Swift actor. Owns the on-disk outbox (`~/Library/Application Support/al/outbox.jsonl`), fetches the server pubkey on demand, refetches before `valid_until`, and ships sealed batches with at-least-once semantics (server PK dedupes). Idle when shipping is unconfigured. |
+| `Pipeline.swift` | Top-level orchestrator. Wires sources→denoiser→engine→writer→shipper. Owns hourly RSS heartbeat. |
 | `Types.swift` | `SourceTag` (mic/system), `AudioSource` protocol, `Utterance` struct. |
-| `MicSource.swift` | `AVAudioEngine` mic capture, 48 kHz mono Float32. Auto-restarts on `AVAudioEngineConfigurationChange` (200 ms debounce, exponential retry). |
-| `SystemAudioSource.swift` | `ScreenCaptureKit` system audio capture, 48 kHz mono Float32. Reconnects on `didStopWithError` with exponential backoff (capped at 30 s); resets counter on first healthy sample. |
-| `DenoisingAudioSource.swift` | Wraps any `AudioSource`, applies `RNNoiseProcessor`, re-broadcasts denoised 48 kHz Float32. One denoiser instance per stream. |
-| `RNNoiseProcessor.swift` | Swift wrapper around vendored xiph/rnnoise v0.1.1. Buffers arbitrary input into 480-sample frames at 48 kHz; ±32768 ↔ ±1 scaling. |
-| `BufferBroadcaster.swift` | Fans `AVAudioPCMBuffer`s out to multiple `AsyncStream` subscribers. `finishAll()` closes all active subscriptions. |
-| `WhisperEngine.swift` | RMS VAD chunker + whisper.cpp transcriber. MONITORING/ACTIVE state machine: 0.1 s onset gate, 2 s silence close, 30 s hard cap, 1.1 s minimum. Shared `whisper_context` serialized with NSLock. Per-source `initial_prompt` continuity. Bounded chunk queue (max 4, drop-oldest). `preloadModel()` / `unloadModel()` for explicit memory control. |
-| `TranscriptWriter.swift` | Swift `actor`. Appends utterance text to `~/.al/<stamp>.txt`. Rotates to a new file on 5-minute idle gap. Lazy directory creation. Retry-once on write failure. |
+| `MicSource.swift` | AVAudioEngine mic capture, 48 kHz mono Float32. Auto-restarts on config change. |
+| `SystemAudioSource.swift` | ScreenCaptureKit system audio capture, 48 kHz mono Float32. Exponential-backoff reconnect. |
+| `DenoisingAudioSource.swift` | Wraps any AudioSource, applies RNNoiseProcessor. |
+| `RNNoiseProcessor.swift` | Swift wrapper around vendored xiph/rnnoise v0.1.1. |
+| `BufferBroadcaster.swift` | Fans AVAudioPCMBuffers out to multiple AsyncStream subscribers. |
+| `SherpaEngine.swift` | Silero VAD + Parakeet TDT 0.6B v3 ASR via sherpa-onnx C API. Per-stream VAD, shared ASR model (NSLock). Crosstalk suppression (zeros mic samples when system audio voiced within 250 ms). |
+| `TranscriptWriter.swift` | Swift actor. Appends utterance text to `~/Documents/al/<yyyy-MM-dd>/<stamp>.txt`. Rotates on 5-minute idle gap. When `Settings.writeLocally` is false, skips all disk IO but still returns a stable virtual file_id for the shipper. |
 | `Permissions.swift` | Non-prompting TCC status probes for microphone and screen recording. |
 | `Log.swift` | Append-only logger to `/tmp/al.log`. Truncates on launch if > 5 MB. |
-| `CRNNoise/` | Vendored xiph/rnnoise v0.1.1 (BSD 3-clause; GRU weights in `rnn_data.c`). |
-| `CWhisper/` | SwiftPM bridge target linking `libwhisper.a` + `libggml*.a` from `build/whisper-prefix/`. |
+| `CRNNoise/` | Vendored xiph/rnnoise v0.1.1 (BSD 3-clause). |
+| `CSherpa/` | SwiftPM bridge target linking libsherpa-onnx-c-api.dylib from `build/sherpa-prefix/`. |
+| `../server/` | Optional Python/FastAPI companion server (Dockerized). Stores sealed lines, decrypts on receipt, groups entries into server-side documents by temporal proximity (across all clients), and exposes text + sentence-transformers semantic search. Rotates X25519 keypairs with overlap and a retention window. See `server/README.md`. |
 
 ## Manual smoke test
 
-Re-run after meaningful pipeline changes.
-
 1. `tccutil reset Microphone local.mtib.al && tccutil reset ScreenCapture local.mtib.al`
 2. `LIVETRANSLATE_SIGN_IDENTITY=LiveTranslateDev ./build.sh && open build/Al.app`
-3. Click ear icon → **Start Listening**. Grant both permissions when prompted.
-4. Speak a sentence. Play a YouTube clip with speech. After 2+ s of silence, `tail -f /tmp/al.log` should show a chunk closing and `TranscriptWriter: opened …`.
-5. `cat ~/.al/*.txt | tail -5` — lines should appear.
-6. Stop, wait 5+ min, Start, speak — a **new file** should appear in `~/.al/`.
-7. Memory check after 30 min: `ps -o rss,command -p $(pgrep -f 'build/Al.app')` — RSS should plateau (model loaded into Metal, ~2 GB total).
+3. Grant both permissions when prompted.
+4. Speak a sentence. Shortly after you stop speaking (Silero closes the segment after ~1.5 s of silence, then ASR runs), `tail -f /tmp/al.log` should show `SherpaEngine[mic]: "…"`.
+5. `cat ~/Documents/al/**/*.txt | tail -5` — lines should appear.
+6. Stop, wait 5+ min, Start, speak — a **new file** should appear in `~/Documents/al/<date>/`.
+7. Memory check: `ps -o rss,command -p $(pgrep -f 'build/Al.app')` — RSS should plateau (~300 MB).
 8. Quit — `/tmp/al.log` ends with `Al: bye`.
+
+### Log shipping (optional)
+
+1. `cd server && AL_PSK="$(openssl rand -hex 32)" docker compose up --build -d`
+2. In the menu-bar popover → **Options…**, paste the URL (`http://localhost:8088`) and the same PSK. Click **Test connection** — it should report "valid for ~7 days".
+3. Speak — `/tmp/al.log` should show `LogShipper: acked up to seq=…` within ~30 s.
+4. Search: `curl -sH "Authorization: Bearer $AL_PSK" 'http://localhost:8088/search?q=hello' | jq .`
+5. Semantic: `curl -sH "Authorization: Bearer $AL_PSK" 'http://localhost:8088/search/semantic?q=meeting' | jq .`
 
 ## Things that have bitten us
 
-(Empty — add when bugs bite.)
+1. **CoreML provider can throw uncatchable C++ exceptions during recognizer
+   init.** `Ort::ThrowOnError` → SIGABRT, before any Swift code can catch it.
+   Stick with `provider = "cpu"` for transducer models like Parakeet unless
+   you've verified every op compiles under CoreML EP.
+
+## Log-shipping protocol
+
+The server's wire format and rotation policy are authoritative; the client
+side mirrors it. Refer to `Sources/Al/Crypto.swift` and `server/README.md`
+for the envelope spec. Two design rules worth carrying forward:
+
+- **Server determines document boundaries.** The client's per-file split is
+  written to disk verbatim but the server re-groups all entries (across all
+  clients) by temporal proximity using `AL_DOCUMENT_GAP_SECONDS`. Don't add
+  client-side aggregation that the server then has to undo.
+- **Pubkey carries `valid_until`.** Server auto-rotates X25519 keys and
+  keeps old private halves around for a retention window. Client refreshes
+  the cached key when it has < 6 h remaining. If you rotate the key
+  manually, in-flight ciphertexts still decrypt.

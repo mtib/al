@@ -1,0 +1,20 @@
+services:
+  al-server:
+    build: .
+    image: al-server:latest
+    container_name: al-server
+    restart: unless-stopped
+    ports:
+      - "8088:8088"
+    environment:
+      # Required: the pre-shared key clients must present in the
+      # Authorization: Bearer <PSK> header on every endpoint.
+      AL_PSK: "${AL_PSK:?AL_PSK must be set}"
+      # Optional overrides:
+      # AL_DATA_DIR: /data
+      # AL_EMBED_MODEL: sentence-transformers/all-MiniLM-L6-v2
+    volumes:
+      - al-data:/data
+
+volumes:
+  al-data:
