@@ -351,26 +351,48 @@ actor LogShipper {
         return entries
     }
 
-    /// Rewrite the outbox dropping acked rows; cap size on the way through.
+    /// Rewrite the outbox dropping acked rows. Called after every
+    /// successful batch ack so the file stays proportional to the unacked
+    /// backlog — without this, a steady trickle of small utterances would
+    /// look like the outbox never clears.
     private func compactOutbox() {
         guard let raw = try? Data(contentsOf: outboxURL) else { return }
-        if raw.count < 64 * 1024 { return }  // not worth it yet
+        if raw.isEmpty { return }
+
         let decoder = JSONDecoder()
         var kept: [OutboxEntry] = []
+        var droppedCount = 0
         var start = raw.startIndex
         while start < raw.endIndex {
             let nl = raw[start..<raw.endIndex].firstIndex(of: 0x0A) ?? raw.endIndex
             let chunk = raw[start..<nl]
             if !chunk.isEmpty, let e = try? decoder.decode(OutboxEntry.self, from: chunk) {
-                if e.seq > lastAckedSeq { kept.append(e) }
+                if e.seq > lastAckedSeq {
+                    kept.append(e)
+                } else {
+                    droppedCount += 1
+                }
             }
             start = nl == raw.endIndex ? raw.endIndex : raw.index(after: nl)
         }
+
+        // Nothing acked since the last compaction → leave the file alone so
+        // we don't burn IO on every poll.
+        if droppedCount == 0 && kept.count <= Self.maxOutboxLines { return }
+
         if kept.count > Self.maxOutboxLines {
             let drop = kept.count - Self.maxOutboxLines
             Log.line("LogShipper: outbox cap reached — dropping \(drop) oldest entries")
             kept = Array(kept.suffix(Self.maxOutboxLines))
         }
+
+        if kept.isEmpty {
+            // Empty file is unnecessary — remove it. The next enqueue will
+            // recreate it via `FileManager.createFile` in `appendOutbox`.
+            try? FileManager.default.removeItem(at: outboxURL)
+            return
+        }
+
         var newData = Data()
         let encoder = JSONEncoder()
         for entry in kept {
