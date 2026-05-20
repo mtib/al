@@ -29,11 +29,25 @@ permissions:
 
 jobs:
   build:
-    runs-on: macos-14
+    # macos-15 ships Xcode 16 by default, which has Swift 6.0 — the package
+    # tools-version. macos-14 still defaults to Xcode 15 / Swift 5.10 and
+    # would fail at `swift build`.
+    runs-on: macos-15
     timeout-minutes: 60
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Select latest Xcode
+        # Pin to the newest installed Xcode so the resolved Swift toolchain
+        # is whatever ships on the runner image. Cheap defence against an
+        # image update that adds an even older Xcode as the default.
+        run: |
+          set -euo pipefail
+          newest=$(ls -d /Applications/Xcode_*.app 2>/dev/null | sort -V | tail -1 || true)
+          if [[ -n "${newest}" ]]; then
+            sudo xcode-select -s "${newest}/Contents/Developer"
+          fi
 
       - name: Show toolchain
         run: |
