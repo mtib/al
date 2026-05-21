@@ -8,8 +8,8 @@ final class Pipeline: @unchecked Sendable {
     private(set) var state: State = .stopped
     private let stateLock = NSLock()
 
-    private var micSource: DenoisingAudioSource?
-    private var systemSource: DenoisingAudioSource?
+    private var micSource: (any AudioSource)?
+    private var systemSource: (any AudioSource)?
     private var engine: SherpaEngine?
     private let writer = TranscriptWriter()
     private let shipper: LogShipper = .shared
@@ -28,9 +28,10 @@ final class Pipeline: @unchecked Sendable {
         state = .starting
         stateLock.unlock()
 
+        let asrModel = await MainActor.run { Settings.shared.asrModel }
         let engine = SherpaEngine()
         do {
-            try engine.preloadModel()
+            try engine.preloadModel(asrModel)
         } catch {
             Log.line("Pipeline: engine preload failed: \(error.localizedDescription)")
             stateLock.lock(); state = .stopped; stateLock.unlock()
@@ -39,10 +40,8 @@ final class Pipeline: @unchecked Sendable {
         }
         self.engine = engine
 
-        let rawMic = MicSource()
-        let rawSys = SystemAudioSource()
-        let mic = DenoisingAudioSource(upstream: rawMic)
-        let sys = DenoisingAudioSource(upstream: rawSys)
+        let mic = MicSource()
+        let sys = SystemAudioSource()
 
         var startedMic = false
         var startedSys = false
@@ -59,7 +58,7 @@ final class Pipeline: @unchecked Sendable {
             return
         }
 
-        let activeSources: [(DenoisingAudioSource, SourceTag)] = [
+        let activeSources: [(any AudioSource, SourceTag)] = [
             startedMic ? (mic, .mic) : nil,
             startedSys ? (sys, .system) : nil,
         ].compactMap { $0 }

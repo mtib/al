@@ -56,34 +56,55 @@ final class SherpaEngine {
 
     // MARK: - Model lifecycle
 
-    func preloadModel() throws {
+    func preloadModel(_ model: ASRModel = .parakeet) throws {
         recognizerLock.lock()
         defer { recognizerLock.unlock() }
         guard recognizer == nil else { return }
 
         let modelsDir = Self.resolveModelsDir()
-        let parakeetDir = modelsDir.appendingPathComponent("sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8")
-
-        // Keep NSString objects alive across the C call — ARC would otherwise release them.
-        let encoderStr   = parakeetDir.appendingPathComponent("encoder.int8.onnx").path as NSString
-        let decoderStr   = parakeetDir.appendingPathComponent("decoder.int8.onnx").path as NSString
-        let joinerStr    = parakeetDir.appendingPathComponent("joiner.int8.onnx").path as NSString
-        let tokensStr    = parakeetDir.appendingPathComponent("tokens.txt").path as NSString
-        let providerStr  = "coreml" as NSString
-        let methodStr    = "greedy_search" as NSString
-        let modelTypeStr = "nemo_transducer" as NSString
-
         var config = SherpaOnnxOfflineRecognizerConfig()
-        config.model_config.transducer.encoder = encoderStr.utf8String
-        config.model_config.transducer.decoder = decoderStr.utf8String
-        config.model_config.transducer.joiner  = joinerStr.utf8String
-        config.model_config.tokens             = tokensStr.utf8String
-        config.model_config.provider           = providerStr.utf8String
-        config.model_config.model_type         = modelTypeStr.utf8String
-        config.model_config.num_threads        = Int32(max(2, ProcessInfo.processInfo.activeProcessorCount - 2))
-        config.decoding_method                 = methodStr.utf8String
+        let threads = Int32(max(2, ProcessInfo.processInfo.activeProcessorCount - 2))
+        let methodStr = "greedy_search" as NSString
 
-        Log.line("SherpaEngine: loading Parakeet TDT 0.6B v3 model at \(parakeetDir.path)")
+        switch model {
+        case .parakeet:
+            let dir = modelsDir.appendingPathComponent("sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8")
+            // Keep NSString objects alive across the C call — ARC would otherwise release them.
+            let encoderStr   = dir.appendingPathComponent("encoder.int8.onnx").path as NSString
+            let decoderStr   = dir.appendingPathComponent("decoder.int8.onnx").path as NSString
+            let joinerStr    = dir.appendingPathComponent("joiner.int8.onnx").path as NSString
+            let tokensStr    = dir.appendingPathComponent("tokens.txt").path as NSString
+            let providerStr  = "coreml" as NSString
+            let modelTypeStr = "nemo_transducer" as NSString
+            config.model_config.transducer.encoder = encoderStr.utf8String
+            config.model_config.transducer.decoder = decoderStr.utf8String
+            config.model_config.transducer.joiner  = joinerStr.utf8String
+            config.model_config.tokens             = tokensStr.utf8String
+            config.model_config.provider           = providerStr.utf8String
+            config.model_config.model_type         = modelTypeStr.utf8String
+            config.model_config.num_threads        = threads
+            config.decoding_method                 = methodStr.utf8String
+            Log.line("SherpaEngine: loading Parakeet TDT 0.6B v3 at \(dir.path)")
+
+        case .moonshine:
+            let dir = modelsDir.appendingPathComponent("sherpa-onnx-moonshine-tiny-en-int8")
+            let preprocessorStr    = dir.appendingPathComponent("preprocess.onnx").path as NSString
+            let encoderStr         = dir.appendingPathComponent("encode.int8.onnx").path as NSString
+            let uncachedDecoderStr = dir.appendingPathComponent("uncached_decode.int8.onnx").path as NSString
+            let cachedDecoderStr   = dir.appendingPathComponent("cached_decode.int8.onnx").path as NSString
+            let tokensStr          = dir.appendingPathComponent("tokens.txt").path as NSString
+            let modelTypeStr       = "moonshine" as NSString
+            config.model_config.moonshine.preprocessor    = preprocessorStr.utf8String
+            config.model_config.moonshine.encoder         = encoderStr.utf8String
+            config.model_config.moonshine.uncached_decoder = uncachedDecoderStr.utf8String
+            config.model_config.moonshine.cached_decoder  = cachedDecoderStr.utf8String
+            config.model_config.tokens                    = tokensStr.utf8String
+            config.model_config.model_type                = modelTypeStr.utf8String
+            config.model_config.num_threads               = threads
+            config.decoding_method                        = methodStr.utf8String
+            Log.line("SherpaEngine: loading Moonshine Tiny at \(dir.path)")
+        }
+
         guard let r = SherpaOnnxCreateOfflineRecognizer(&config) else {
             throw SherpaEngineError.modelLoadFailed("SherpaOnnxCreateOfflineRecognizer returned nil")
         }
@@ -140,7 +161,7 @@ final class SherpaEngine {
         var silero = SherpaOnnxSileroVadModelConfig()
         silero.model                = vadModelStr.utf8String
         silero.threshold            = 0.5
-        silero.min_silence_duration = 1.5
+        silero.min_silence_duration = 1.0
         silero.min_speech_duration  = 0.1
         silero.window_size          = Int32(vadChunkSize)
         silero.max_speech_duration  = 30.0  // C++ default; 0 causes immediate threshold spike

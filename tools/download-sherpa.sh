@@ -74,6 +74,26 @@ else
     echo "✓ parakeet-tdt-0.6b-v3-int8 already present"
 fi
 
+# --- Moonshine Tiny int8 (optional lightweight model) ---
+MOONSHINE_DIR="${MODEL_DIR}/sherpa-onnx-moonshine-tiny-en-int8"
+if [[ "$FORCE" == "--force" ]] || [[ ! -d "${MOONSHINE_DIR}" ]]; then
+    if [[ "$FORCE" == "--force" ]]; then
+        echo "→ forcing re-download of moonshine-tiny-en-int8 (~45 MB)…"
+        rm -rf "${MOONSHINE_DIR}"
+    else
+        echo "→ downloading moonshine-tiny-en-int8 (~45 MB)…"
+    fi
+    rm -rf "${MODEL_DIR}/moonshine-staging"
+    mkdir -p "${MODEL_DIR}/moonshine-staging"
+    curl -fSL "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-moonshine-tiny-en-int8.tar.bz2" \
+         | tar xj -C "${MODEL_DIR}/moonshine-staging"
+    mv "${MODEL_DIR}/moonshine-staging/sherpa-onnx-moonshine-tiny-en-int8" "${MOONSHINE_DIR}"
+    rm -rf "${MODEL_DIR}/moonshine-staging"
+    echo "✓ moonshine-tiny-en-int8 ($(du -sh "${MOONSHINE_DIR}" | cut -f1))"
+else
+    echo "✓ moonshine-tiny-en-int8 already present"
+fi
+
 # --- Patch CSherpa forwarding header ---
 mkdir -p Sources/CSherpa/include
 cat > Sources/CSherpa/include/c-api.h <<'HEADER'

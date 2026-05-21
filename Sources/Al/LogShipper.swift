@@ -4,29 +4,25 @@ import CryptoKit
 /// Ships transcript utterances to an optional remote server using the
 /// sealed-box scheme defined in `Crypto.swift`.
 ///
-/// **Outbox.** Each utterance is enqueued as a JSON record on a single
-/// append-only file at `~/Library/Application Support/al/outbox.jsonl`. The
-/// plaintext payload lives on disk only because the transcripts themselves
-/// already live in `~/Documents/al/`; encrypting the queue would provide no
-/// additional confidentiality. We encrypt freshly per send so a server-URL
-/// change is non-destructive.
+/// **Outbox.** Pending entries are kept in memory only; they are not written
+/// to disk. Entries not yet acknowledged by the server are lost on crash or
+/// quit — the on-disk transcript in `~/Documents/al/` remains the source of
+/// truth. We encrypt freshly per send so a server-URL change is
+/// non-destructive.
 ///
 /// **Worker loop.** A single Task wakes on enqueue or every 30 s, fetches
 /// the server pubkey if missing, then drains the outbox in batches. The
 /// server's `(client_id, seq)` primary key makes retries idempotent.
 ///
 /// **Disabled mode.** When the user hasn't set a server URL + PSK the
-/// shipper keeps appending to the outbox (so utterances aren't lost during
-/// configuration churn) but never sends. A reasonable size cap on the
-/// outbox prevents unbounded growth — once the cap is hit we drop the
-/// oldest entries with a Log line.
+/// shipper keeps enqueueing (capped at `maxOutboxEntries`) but never sends.
 actor LogShipper {
 
     static let shared = LogShipper()
 
-    // MARK: - Disk layout
+    // MARK: - Constants
 
-    private static let maxOutboxLines = 50_000
+    private static let maxOutboxEntries = 50_000
     private static let batchSize = 64
     private static let pollSeconds: UInt64 = 30
     private static let backoffSeconds: UInt64 = 15
@@ -37,12 +33,11 @@ actor LogShipper {
     private static let pubkeyRefreshMargin: TimeInterval = 6 * 3600  // 6 h
 
     private let stateURL: URL
-    private let outboxURL: URL
 
     // MARK: - Mutable state
 
     private var nextSeq: UInt64 = 1
-    private var lastAckedSeq: UInt64 = 0
+    private var outbox: [OutboxEntry] = []
     private var serverPubkey: Data?
     private var serverPubkeyForURL: String = ""
     /// Unix seconds the current pubkey is advertised as valid until. 0 = unknown.
@@ -63,7 +58,6 @@ actor LogShipper {
         let dir = support.appendingPathComponent("al", isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         self.stateURL = dir.appendingPathComponent("shipper-state.json")
-        self.outboxURL = dir.appendingPathComponent("outbox.jsonl")
         loadState()
     }
 
@@ -88,7 +82,7 @@ actor LogShipper {
         workerTask = Task { [weak self] in
             await self?.runLoop()
         }
-        Log.line("LogShipper: started (next_seq=\(nextSeq), last_acked=\(lastAckedSeq))")
+        Log.line("LogShipper: started (next_seq=\(nextSeq), outbox=\(outbox.count))")
     }
 
     func stop() async {
@@ -108,6 +102,10 @@ actor LogShipper {
     /// after the line has been written to disk so the on-disk transcript
     /// remains the source of truth even if the shipper drops the entry.
     func enqueue(fileId: String, utterance: Utterance) {
+        if outbox.count >= Self.maxOutboxEntries {
+            outbox.removeFirst()
+            Log.line("LogShipper: outbox cap reached — dropping oldest entry")
+        }
         let payload = Payload(
             file_id: fileId,
             source: utterance.source.rawValue,
@@ -115,9 +113,8 @@ actor LogShipper {
             ended_at: utterance.endedAt.timeIntervalSince1970,
             text: utterance.text
         )
-        let entry = OutboxEntry(seq: nextSeq, payload: payload)
+        outbox.append(OutboxEntry(seq: nextSeq, payload: payload))
         nextSeq &+= 1
-        appendOutbox(entry)
         saveState()
         wakeCont?.yield()
     }
@@ -183,10 +180,9 @@ actor LogShipper {
         }
         guard let pubkey = serverPubkey else { return }
 
-        let pending = readPending()
-        if pending.isEmpty { return }
+        if outbox.isEmpty { return }
 
-        let batch = Array(pending.prefix(Self.batchSize))
+        let batch = Array(outbox.prefix(Self.batchSize))
         var sealed: [SealedEntry] = []
         sealed.reserveCapacity(batch.count)
         for entry in batch {
@@ -203,14 +199,13 @@ actor LogShipper {
         let req = IngestRequest(client_id: snap.clientId, batch: sealed)
         switch await sendBatch(req, snapshot: snap) {
         case .success(let highestAcked):
-            if highestAcked > lastAckedSeq {
-                lastAckedSeq = highestAcked
+            let before = outbox.count
+            outbox.removeAll { $0.seq <= highestAcked }
+            if outbox.count < before {
                 saveState()
-                compactOutbox()
                 Log.line("LogShipper: acked up to seq=\(highestAcked) (\(batch.count) sent)")
             }
-            // If there's more pending, schedule another pass immediately.
-            if pending.count > batch.count {
+            if !outbox.isEmpty {
                 wakeCont?.yield()
             }
         case .failure(let why):
@@ -308,111 +303,10 @@ actor LogShipper {
         }
     }
 
-    // MARK: - Outbox persistence
-
-    private func appendOutbox(_ entry: OutboxEntry) {
-        do {
-            let data = try JSONEncoder().encode(entry)
-            var line = Data()
-            line.append(data)
-            line.append(0x0A)  // newline
-            if !FileManager.default.fileExists(atPath: outboxURL.path) {
-                FileManager.default.createFile(atPath: outboxURL.path, contents: nil)
-            }
-            let handle = try FileHandle(forWritingTo: outboxURL)
-            defer { try? handle.close() }
-            try handle.seekToEnd()
-            try handle.write(contentsOf: line)
-        } catch {
-            Log.line("LogShipper: outbox append failed: \(error.localizedDescription)")
-        }
-    }
-
-    private func readPending() -> [OutboxEntry] {
-        guard let raw = try? Data(contentsOf: outboxURL) else { return [] }
-        var entries: [OutboxEntry] = []
-        let decoder = JSONDecoder()
-        var start = raw.startIndex
-        while start < raw.endIndex {
-            guard let nl = raw[start..<raw.endIndex].firstIndex(of: 0x0A) else {
-                let chunk = raw[start..<raw.endIndex]
-                if !chunk.isEmpty, let e = try? decoder.decode(OutboxEntry.self, from: chunk) {
-                    if e.seq > lastAckedSeq { entries.append(e) }
-                }
-                break
-            }
-            let chunk = raw[start..<nl]
-            if !chunk.isEmpty, let e = try? decoder.decode(OutboxEntry.self, from: chunk) {
-                if e.seq > lastAckedSeq { entries.append(e) }
-            }
-            start = raw.index(after: nl)
-        }
-        entries.sort { $0.seq < $1.seq }
-        return entries
-    }
-
-    /// Rewrite the outbox dropping acked rows. Called after every
-    /// successful batch ack so the file stays proportional to the unacked
-    /// backlog — without this, a steady trickle of small utterances would
-    /// look like the outbox never clears.
-    private func compactOutbox() {
-        guard let raw = try? Data(contentsOf: outboxURL) else { return }
-        if raw.isEmpty { return }
-
-        let decoder = JSONDecoder()
-        var kept: [OutboxEntry] = []
-        var droppedCount = 0
-        var start = raw.startIndex
-        while start < raw.endIndex {
-            let nl = raw[start..<raw.endIndex].firstIndex(of: 0x0A) ?? raw.endIndex
-            let chunk = raw[start..<nl]
-            if !chunk.isEmpty, let e = try? decoder.decode(OutboxEntry.self, from: chunk) {
-                if e.seq > lastAckedSeq {
-                    kept.append(e)
-                } else {
-                    droppedCount += 1
-                }
-            }
-            start = nl == raw.endIndex ? raw.endIndex : raw.index(after: nl)
-        }
-
-        // Nothing acked since the last compaction → leave the file alone so
-        // we don't burn IO on every poll.
-        if droppedCount == 0 && kept.count <= Self.maxOutboxLines { return }
-
-        if kept.count > Self.maxOutboxLines {
-            let drop = kept.count - Self.maxOutboxLines
-            Log.line("LogShipper: outbox cap reached — dropping \(drop) oldest entries")
-            kept = Array(kept.suffix(Self.maxOutboxLines))
-        }
-
-        if kept.isEmpty {
-            // Empty file is unnecessary — remove it. The next enqueue will
-            // recreate it via `FileManager.createFile` in `appendOutbox`.
-            try? FileManager.default.removeItem(at: outboxURL)
-            return
-        }
-
-        var newData = Data()
-        let encoder = JSONEncoder()
-        for entry in kept {
-            if let line = try? encoder.encode(entry) {
-                newData.append(line)
-                newData.append(0x0A)
-            }
-        }
-        do {
-            try newData.write(to: outboxURL, options: .atomic)
-        } catch {
-            Log.line("LogShipper: compact failed: \(error.localizedDescription)")
-        }
-    }
-
     // MARK: - State JSON
 
     private struct PersistedState: Codable {
         var nextSeq: UInt64
-        var lastAckedSeq: UInt64
         var serverPubkeyB64: String?
         var serverPubkeyForURL: String?
         var serverPubkeyValidUntil: Double?
@@ -424,7 +318,6 @@ actor LogShipper {
             return
         }
         self.nextSeq = max(s.nextSeq, 1)
-        self.lastAckedSeq = s.lastAckedSeq
         if let b64 = s.serverPubkeyB64, let data = Data(base64Encoded: b64), data.count == 32 {
             self.serverPubkey = data
             self.serverPubkeyForURL = s.serverPubkeyForURL ?? ""
@@ -435,7 +328,6 @@ actor LogShipper {
     private func saveState() {
         let s = PersistedState(
             nextSeq: nextSeq,
-            lastAckedSeq: lastAckedSeq,
             serverPubkeyB64: serverPubkey?.base64EncodedString(),
             serverPubkeyForURL: serverPubkeyForURL.isEmpty ? nil : serverPubkeyForURL,
             serverPubkeyValidUntil: serverPubkeyValidUntil > 0 ? serverPubkeyValidUntil : nil

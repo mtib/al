@@ -76,6 +76,16 @@ final class MenuBarController: NSObject, NSPopoverDelegate {
                 self?.model.append(utt)
             }
         }
+        NotificationCenter.default.addObserver(
+            forName: Settings.didChange, object: nil, queue: .main
+        ) { [weak self] _ in
+            guard let self else { return }
+            Task { @MainActor [weak self] in
+                guard let self, self.pipeline.state == .running else { return }
+                await self.pipeline.stop()
+                await self.pipeline.start()
+            }
+        }
     }
 
     // MARK: - Actions
