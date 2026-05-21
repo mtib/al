@@ -1,10 +1,14 @@
 import Foundation
 import SwiftUI
 
+/// Cases are declared in **descending strength order** (best transcription
+/// quality first). `OptionsView` walks `allCases` so the picker shows the
+/// most accurate model at the top.
 enum ASRModel: String, CaseIterable {
+    case parakeet06b               = "parakeet"        // raw value kept for migration
     case parakeet110m              = "parakeet110m"
     case fastConformerMultilingual = "fastConformerMultilingual"
-    case moonshineTiny             = "moonshine"  // kept the raw value for migration
+    case moonshineTiny             = "moonshine"
 
     var displayName: String {
         switch self {
@@ -12,6 +16,8 @@ enum ASRModel: String, CaseIterable {
             return "Parakeet TDT-CTC 110M — English, best quality (~99 MB)"
         case .fastConformerMultilingual:
             return "FastConformer CTC — EN/DE/ES/FR multilingual (~98 MB)"
+        case .parakeet06b:
+            return "Parakeet TDT 0.6B v3 — English, heavy beast (~465 MB)"
         case .moonshineTiny:
             return "Moonshine Tiny — English, smallest footprint (~45 MB)"
         }
@@ -20,9 +26,8 @@ enum ASRModel: String, CaseIterable {
     /// Two-letter ISO language tags this model can transcribe. Used for UI labelling.
     var languages: [String] {
         switch self {
-        case .parakeet110m:              return ["en"]
-        case .fastConformerMultilingual: return ["en", "de", "es", "fr"]
-        case .moonshineTiny:             return ["en"]
+        case .parakeet110m, .parakeet06b, .moonshineTiny: return ["en"]
+        case .fastConformerMultilingual:                  return ["en", "de", "es", "fr"]
         }
     }
 }
@@ -87,10 +92,7 @@ final class Settings: ObservableObject {
         self.serverURL = d.string(forKey: Key.serverURL) ?? ""
         self.psk = d.string(forKey: Key.psk) ?? ""
         self.writeLocally = d.object(forKey: Key.writeLocally) as? Bool ?? true
-        // Older builds stored "parakeet" (= 0.6B) — silently migrate to the lighter 110M.
-        let storedASR = d.string(forKey: Key.asrModel) ?? ""
-        self.asrModel = ASRModel(rawValue: storedASR)
-            ?? (storedASR == "parakeet" ? .parakeet110m : .parakeet110m)
+        self.asrModel = ASRModel(rawValue: d.string(forKey: Key.asrModel) ?? "") ?? .parakeet110m
         if let existing = d.string(forKey: Key.clientId), !existing.isEmpty {
             self.clientId = existing
         } else {

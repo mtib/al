@@ -98,6 +98,24 @@ final class SherpaEngine {
             config.model_config.model_type     = modelTypeStr.utf8String
             Log.line("SherpaEngine: loading FastConformer CTC multilingual (en/de/es/fr) at \(dir.path)")
 
+        case .parakeet06b:
+            // NeMo Parakeet TDT 0.6B v3 — encoder/decoder/joiner transducer.
+            // Heavy: ~465 MB on disk, ≥1.5 GB RSS in use, not realtime on M1 Air.
+            // Kept as an opt-in option for users with headroom (M1 Pro+, Air+ Studio Display, etc.).
+            let dir = modelsDir.appendingPathComponent("sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8")
+            let encoderStr   = dir.appendingPathComponent("encoder.int8.onnx").path as NSString
+            let decoderStr   = dir.appendingPathComponent("decoder.int8.onnx").path as NSString
+            let joinerStr    = dir.appendingPathComponent("joiner.int8.onnx").path as NSString
+            let tokensStr    = dir.appendingPathComponent("tokens.txt").path as NSString
+            let modelTypeStr = "nemo_transducer" as NSString
+            keepAlive.append(contentsOf: [encoderStr, decoderStr, joinerStr, tokensStr, modelTypeStr])
+            config.model_config.transducer.encoder = encoderStr.utf8String
+            config.model_config.transducer.decoder = decoderStr.utf8String
+            config.model_config.transducer.joiner  = joinerStr.utf8String
+            config.model_config.tokens             = tokensStr.utf8String
+            config.model_config.model_type         = modelTypeStr.utf8String
+            Log.line("SherpaEngine: loading Parakeet TDT 0.6B v3 (en) at \(dir.path)")
+
         case .moonshineTiny:
             let dir = modelsDir.appendingPathComponent("sherpa-onnx-moonshine-tiny-en-int8")
             let preprocessorStr    = dir.appendingPathComponent("preprocess.onnx").path as NSString

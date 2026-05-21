@@ -51,7 +51,8 @@ decodes it in one call. The model is user-selectable in Options:
 |---|---|---|---|
 | **Parakeet TDT-CTC 110M** *(default)* | EN | ~99 MB | NeMo CTC head, single ONNX file, low bounded RAM, best EN quality. |
 | **FastConformer CTC multilingual** | EN / DE / ES / FR | ~98 MB | NeMo CTC, the only sherpa-onnx-packaged offline model that covers German. |
-| **Moonshine Tiny** | EN | ~45 MB | Smallest footprint; accuracy worst of the three. |
+| **Parakeet TDT 0.6B v3** | EN | ~465 MB | Heavy NeMo transducer (encoder/decoder/joiner). Not realtime on M1 Air; opt-in for machines with headroom. |
+| **Moonshine Tiny** | EN | ~45 MB | Smallest footprint; accuracy worst of the four. |
 
 All three load through `SherpaOnnxOfflineRecognizer` with `provider = "coreml"`.
 CTC models share the same code path (`model_config.nemo_ctc.model`); Moonshine

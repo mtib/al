@@ -58,7 +58,6 @@ fi
 # --- Stale model cleanup ---
 # Drop obsolete model bundles so they don't get shipped into the .app.
 rm -rf "${MODEL_DIR}/sherpa-onnx-moonshine-base-en-int8"
-rm -rf "${MODEL_DIR}/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8"
 
 # Helper: idempotent download + extract of a sherpa-onnx asr-models tar.bz2.
 # Args: <archive-stem> <human-name> <approx-size>
@@ -92,6 +91,9 @@ fetch_asr_model "sherpa-onnx-nemo-parakeet_tdt_ctc_110m-en-36000-int8" "parakeet
 
 # --- FastConformer CTC multilingual (EN/DE/ES/FR) ---
 fetch_asr_model "sherpa-onnx-nemo-fast-conformer-ctc-en-de-es-fr-14288-int8" "fast-conformer-ctc-en-de-es-fr-int8" "98 MB"
+
+# --- Parakeet TDT 0.6B v3 (English, heavyweight transducer) ---
+fetch_asr_model "sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8" "parakeet-tdt-0.6b-v3-int8" "465 MB"
 
 # --- Moonshine Tiny int8 (lightweight English fallback) ---
 fetch_asr_model "sherpa-onnx-moonshine-tiny-en-int8" "moonshine-tiny-en-int8" "45 MB"
