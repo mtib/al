@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
-# Download sherpa-onnx pre-built dylibs, Silero VAD model, and Parakeet TDT ASR model.
+# Download sherpa-onnx pre-built dylibs, Silero VAD model, and the ASR models
+# used by the in-app picker:
+#   * Parakeet TDT-CTC 110M (English)
+#   * FastConformer CTC multilingual (EN/DE/ES/FR)
+#   * Moonshine Tiny (English, lightest)
 # Idempotent: skips downloads when sentinel files already exist.
 # Pass --force to re-download everything.
 set -euo pipefail
@@ -51,48 +55,46 @@ else
     echo "✓ silero_vad.onnx already present"
 fi
 
-# --- NeMo Parakeet TDT 0.6B v3 (int8) ---
-# Drop the old Moonshine model if present so it doesn't get bundled into the app.
+# --- Stale model cleanup ---
+# Drop obsolete model bundles so they don't get shipped into the .app.
 rm -rf "${MODEL_DIR}/sherpa-onnx-moonshine-base-en-int8"
+rm -rf "${MODEL_DIR}/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8"
 
-PARAKEET_DIR="${MODEL_DIR}/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8"
-if [[ "$FORCE" == "--force" ]] || [[ ! -d "${PARAKEET_DIR}" ]]; then
-    if [[ "$FORCE" == "--force" ]]; then
-        echo "→ forcing re-download of parakeet-tdt-0.6b-v3-int8 (~465 MB)…"
-        rm -rf "${PARAKEET_DIR}"
+# Helper: idempotent download + extract of a sherpa-onnx asr-models tar.bz2.
+# Args: <archive-stem> <human-name> <approx-size>
+fetch_asr_model() {
+    local stem="$1"
+    local nice="$2"
+    local size="$3"
+    local dir="${MODEL_DIR}/${stem}"
+    local staging="${MODEL_DIR}/.staging-${stem}"
+    local url="https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/${stem}.tar.bz2"
+    if [[ "$FORCE" == "--force" ]] || [[ ! -d "${dir}" ]]; then
+        if [[ "$FORCE" == "--force" ]]; then
+            echo "→ forcing re-download of ${nice} (~${size})…"
+            rm -rf "${dir}"
+        else
+            echo "→ downloading ${nice} (~${size})…"
+        fi
+        rm -rf "${staging}"
+        mkdir -p "${staging}"
+        curl -fSL "${url}" | tar xj -C "${staging}"
+        mv "${staging}/${stem}" "${dir}"
+        rm -rf "${staging}"
+        echo "✓ ${stem} ($(du -sh "${dir}" | cut -f1))"
     else
-        echo "→ downloading parakeet-tdt-0.6b-v3-int8 (~465 MB)…"
+        echo "✓ ${stem} already present"
     fi
-    rm -rf "${MODEL_DIR}/parakeet-staging"
-    mkdir -p "${MODEL_DIR}/parakeet-staging"
-    curl -fSL "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8.tar.bz2" \
-         | tar xj -C "${MODEL_DIR}/parakeet-staging"
-    mv "${MODEL_DIR}/parakeet-staging/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8" "${PARAKEET_DIR}"
-    rm -rf "${MODEL_DIR}/parakeet-staging"
-    echo "✓ parakeet-tdt-0.6b-v3-int8 ($(du -sh "${PARAKEET_DIR}" | cut -f1))"
-else
-    echo "✓ parakeet-tdt-0.6b-v3-int8 already present"
-fi
+}
 
-# --- Moonshine Tiny int8 (optional lightweight model) ---
-MOONSHINE_DIR="${MODEL_DIR}/sherpa-onnx-moonshine-tiny-en-int8"
-if [[ "$FORCE" == "--force" ]] || [[ ! -d "${MOONSHINE_DIR}" ]]; then
-    if [[ "$FORCE" == "--force" ]]; then
-        echo "→ forcing re-download of moonshine-tiny-en-int8 (~45 MB)…"
-        rm -rf "${MOONSHINE_DIR}"
-    else
-        echo "→ downloading moonshine-tiny-en-int8 (~45 MB)…"
-    fi
-    rm -rf "${MODEL_DIR}/moonshine-staging"
-    mkdir -p "${MODEL_DIR}/moonshine-staging"
-    curl -fSL "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-moonshine-tiny-en-int8.tar.bz2" \
-         | tar xj -C "${MODEL_DIR}/moonshine-staging"
-    mv "${MODEL_DIR}/moonshine-staging/sherpa-onnx-moonshine-tiny-en-int8" "${MOONSHINE_DIR}"
-    rm -rf "${MODEL_DIR}/moonshine-staging"
-    echo "✓ moonshine-tiny-en-int8 ($(du -sh "${MOONSHINE_DIR}" | cut -f1))"
-else
-    echo "✓ moonshine-tiny-en-int8 already present"
-fi
+# --- Parakeet TDT-CTC 110M (English) ---
+fetch_asr_model "sherpa-onnx-nemo-parakeet_tdt_ctc_110m-en-36000-int8" "parakeet-tdt-ctc-110m-en-int8" "99 MB"
+
+# --- FastConformer CTC multilingual (EN/DE/ES/FR) ---
+fetch_asr_model "sherpa-onnx-nemo-fast-conformer-ctc-en-de-es-fr-14288-int8" "fast-conformer-ctc-en-de-es-fr-int8" "98 MB"
+
+# --- Moonshine Tiny int8 (lightweight English fallback) ---
+fetch_asr_model "sherpa-onnx-moonshine-tiny-en-int8" "moonshine-tiny-en-int8" "45 MB"
 
 # --- Patch CSherpa forwarding header ---
 mkdir -p Sources/CSherpa/include

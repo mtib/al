@@ -3,17 +3,21 @@ import AVFoundation
 import Accelerate
 import CSherpa
 
-/// Transcription engine using Silero VAD + NeMo Parakeet TDT 0.6B v3 ASR via sherpa-onnx.
+/// Transcription engine using Silero VAD + a sherpa-onnx offline ASR model.
+///
+/// The actual model is picked at preload time (see `ASRModel`). All current
+/// options run via `SherpaOnnxOfflineRecognizer` so the VAD-chunked pipeline
+/// shape is identical regardless of model.
 ///
 /// **Pipeline per stream:**
 ///   1. 48 kHz AVAudioPCMBuffer → resample to 16 kHz mono Float32
 ///   2. Crosstalk suppression: mic samples zeroed when system audio voiced within 250 ms
 ///   3. 16 kHz samples fed in 512-sample chunks to a per-stream Silero VAD
-///   4. When Silero signals a complete speech segment, Parakeet ASR runs (CPU)
+///   4. When Silero signals a complete speech segment, ASR runs (CoreML)
 ///   5. Non-empty results emitted as Utterance values
 ///
-/// **Shared state:** One `SherpaOnnxOfflineRecognizer` (Parakeet) shared across
-/// both streams, serialised with `recognizerLock`. Each stream owns its own
+/// **Shared state:** One `SherpaOnnxOfflineRecognizer` shared across both
+/// streams, serialised with `recognizerLock`. Each stream owns its own
 /// `SherpaOnnxVoiceActivityDetector` (Silero maintains per-stream state).
 ///
 /// **Lifecycle invariant:** `unloadModel()` must only be called after all
@@ -56,7 +60,7 @@ final class SherpaEngine {
 
     // MARK: - Model lifecycle
 
-    func preloadModel(_ model: ASRModel = .parakeet) throws {
+    func preloadModel(_ model: ASRModel = .parakeet110m) throws {
         recognizerLock.lock()
         defer { recognizerLock.unlock() }
         guard recognizer == nil else { return }
@@ -65,28 +69,36 @@ final class SherpaEngine {
         var config = SherpaOnnxOfflineRecognizerConfig()
         let threads = Int32(max(2, ProcessInfo.processInfo.activeProcessorCount - 2))
         let methodStr = "greedy_search" as NSString
+        let providerStr = "coreml" as NSString
+        // Strong refs to keep NSString-derived utf8String pointers alive across the C call.
+        var keepAlive: [NSString] = [methodStr, providerStr]
 
         switch model {
-        case .parakeet:
-            let dir = modelsDir.appendingPathComponent("sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8")
-            // Keep NSString objects alive across the C call — ARC would otherwise release them.
-            let encoderStr   = dir.appendingPathComponent("encoder.int8.onnx").path as NSString
-            let decoderStr   = dir.appendingPathComponent("decoder.int8.onnx").path as NSString
-            let joinerStr    = dir.appendingPathComponent("joiner.int8.onnx").path as NSString
+        case .parakeet110m:
+            // NVIDIA NeMo Parakeet TDT-CTC 110M — English, single-file CTC head.
+            let dir = modelsDir.appendingPathComponent("sherpa-onnx-nemo-parakeet_tdt_ctc_110m-en-36000-int8")
+            let modelStr     = dir.appendingPathComponent("model.int8.onnx").path as NSString
             let tokensStr    = dir.appendingPathComponent("tokens.txt").path as NSString
-            let providerStr  = "coreml" as NSString
-            let modelTypeStr = "nemo_transducer" as NSString
-            config.model_config.transducer.encoder = encoderStr.utf8String
-            config.model_config.transducer.decoder = decoderStr.utf8String
-            config.model_config.transducer.joiner  = joinerStr.utf8String
-            config.model_config.tokens             = tokensStr.utf8String
-            config.model_config.provider           = providerStr.utf8String
-            config.model_config.model_type         = modelTypeStr.utf8String
-            config.model_config.num_threads        = threads
-            config.decoding_method                 = methodStr.utf8String
-            Log.line("SherpaEngine: loading Parakeet TDT 0.6B v3 at \(dir.path)")
+            let modelTypeStr = "nemo_ctc" as NSString
+            keepAlive.append(contentsOf: [modelStr, tokensStr, modelTypeStr])
+            config.model_config.nemo_ctc.model = modelStr.utf8String
+            config.model_config.tokens         = tokensStr.utf8String
+            config.model_config.model_type     = modelTypeStr.utf8String
+            Log.line("SherpaEngine: loading Parakeet TDT-CTC 110M (en) at \(dir.path)")
 
-        case .moonshine:
+        case .fastConformerMultilingual:
+            // NeMo FastConformer CTC, EN/DE/ES/FR, single-file CTC head.
+            let dir = modelsDir.appendingPathComponent("sherpa-onnx-nemo-fast-conformer-ctc-en-de-es-fr-14288-int8")
+            let modelStr     = dir.appendingPathComponent("model.int8.onnx").path as NSString
+            let tokensStr    = dir.appendingPathComponent("tokens.txt").path as NSString
+            let modelTypeStr = "nemo_ctc" as NSString
+            keepAlive.append(contentsOf: [modelStr, tokensStr, modelTypeStr])
+            config.model_config.nemo_ctc.model = modelStr.utf8String
+            config.model_config.tokens         = tokensStr.utf8String
+            config.model_config.model_type     = modelTypeStr.utf8String
+            Log.line("SherpaEngine: loading FastConformer CTC multilingual (en/de/es/fr) at \(dir.path)")
+
+        case .moonshineTiny:
             let dir = modelsDir.appendingPathComponent("sherpa-onnx-moonshine-tiny-en-int8")
             let preprocessorStr    = dir.appendingPathComponent("preprocess.onnx").path as NSString
             let encoderStr         = dir.appendingPathComponent("encode.int8.onnx").path as NSString
@@ -94,21 +106,24 @@ final class SherpaEngine {
             let cachedDecoderStr   = dir.appendingPathComponent("cached_decode.int8.onnx").path as NSString
             let tokensStr          = dir.appendingPathComponent("tokens.txt").path as NSString
             let modelTypeStr       = "moonshine" as NSString
+            keepAlive.append(contentsOf: [preprocessorStr, encoderStr, uncachedDecoderStr, cachedDecoderStr, tokensStr, modelTypeStr])
             config.model_config.moonshine.preprocessor    = preprocessorStr.utf8String
             config.model_config.moonshine.encoder         = encoderStr.utf8String
             config.model_config.moonshine.uncached_decoder = uncachedDecoderStr.utf8String
             config.model_config.moonshine.cached_decoder  = cachedDecoderStr.utf8String
             config.model_config.tokens                    = tokensStr.utf8String
             config.model_config.model_type                = modelTypeStr.utf8String
-            config.model_config.num_threads               = threads
-            config.decoding_method                        = methodStr.utf8String
-            Log.line("SherpaEngine: loading Moonshine Tiny at \(dir.path)")
+            Log.line("SherpaEngine: loading Moonshine Tiny (en) at \(dir.path)")
         }
+        config.model_config.provider    = providerStr.utf8String
+        config.model_config.num_threads = threads
+        config.decoding_method          = methodStr.utf8String
 
         guard let r = SherpaOnnxCreateOfflineRecognizer(&config) else {
             throw SherpaEngineError.modelLoadFailed("SherpaOnnxCreateOfflineRecognizer returned nil")
         }
         recognizer = r
+        _ = keepAlive  // ensure ARC keeps the NSStrings alive across the C call
         Log.line("SherpaEngine: model loaded")
     }
 
@@ -181,19 +196,40 @@ final class SherpaEngine {
         let resampler = SherpaResampler()
         var pendingBuf: [Float] = []
         var pendingIdx: Int = 0
+        // `micGated` tracks whether the mic stream is currently bypassed by
+        // crosstalk. The system stream never gates itself.
+        var micGated: Bool = false
 
         Log.line("SherpaEngine[\(tag)]: VAD loop started")
 
         for await buf in audio {
             if Task.isCancelled { break }
-            guard var samples16k = resampler.convert(buf) else { continue }
 
-            // Crosstalk suppression: zero mic during system audio activity
-            if source == .mic && isCrosstalkActive() {
-                samples16k = [Float](repeating: 0, count: samples16k.count)
+            // Crosstalk gate: when system audio is currently voiced, drop the
+            // mic stream off the pipeline entirely — no resample, no VAD, no
+            // ASR. This frees CPU/ANE for the (single, NSLock-serialised)
+            // recognizer instance and avoids re-transcribing speaker bleed.
+            // On gate entry we flush the mic VAD so any in-progress segment
+            // closes cleanly before we go quiet.
+            if source == .mic {
+                if isCrosstalkActive() {
+                    if !micGated {
+                        micGated = true
+                        SherpaOnnxVoiceActivityDetectorFlush(vad)
+                        drainSegments(vad: vad, recognizer: recognizer, source: source, continuation: continuation)
+                        Log.line("SherpaEngine[mic]: gated (system audio active)")
+                    }
+                    continue
+                } else if micGated {
+                    micGated = false
+                    Log.line("SherpaEngine[mic]: ungated")
+                }
             }
 
-            // Stamp system voice activity timestamp for crosstalk suppression
+            guard let samples16k = resampler.convert(buf) else { continue }
+
+            // Stamp system voice activity timestamp for crosstalk suppression.
+            // RMS check on the raw 48 kHz buffer (cheap, no extra alloc).
             if source == .system, let data = buf.floatChannelData?[0] {
                 let n = Int(buf.frameLength)
                 var meanSquare: Float = 0
@@ -203,7 +239,9 @@ final class SherpaEngine {
 
             pendingBuf.append(contentsOf: samples16k)
 
-            // Feed complete 512-sample chunks to Silero without O(n) copies
+            // Feed complete 512-sample chunks to Silero without O(n) copies.
+            // Compact aggressively (after every drain) so the buffer head doesn't
+            // sit on kilobytes of stale samples on M1 Air under sustained load.
             while pendingBuf.count - pendingIdx >= vadChunkSize {
                 pendingBuf.withUnsafeBufferPointer { ptr in
                     SherpaOnnxVoiceActivityDetectorAcceptWaveform(
@@ -211,11 +249,10 @@ final class SherpaEngine {
                 }
                 pendingIdx += vadChunkSize
                 drainSegments(vad: vad, recognizer: recognizer, source: source, continuation: continuation)
-                // Compact when head exceeds a threshold to avoid unbounded growth
-                if pendingIdx > 4096 {
-                    pendingBuf.removeFirst(pendingIdx)
-                    pendingIdx = 0
-                }
+            }
+            if pendingIdx >= vadChunkSize {
+                pendingBuf.removeFirst(pendingIdx)
+                pendingIdx = 0
             }
         }
 

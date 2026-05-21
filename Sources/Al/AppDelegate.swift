@@ -87,17 +87,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return main
     }
 
-    func applicationWillTerminate(_ notification: Notification) {
-        Log.line("Al: terminating — draining pipeline")
-        // Block briefly for a clean shutdown (writer flush + engine unload).
-        let group = DispatchGroup()
-        group.enter()
-        Task {
+    /// Polished quit: hand AppKit a `.terminateLater` reply, drain on a
+    /// background task, then unblock termination once writers are flushed.
+    /// Keeps the run loop pumping so the popover closes and the menu-bar
+    /// icon stays responsive instead of looking frozen for a few seconds.
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        Log.line("Al: terminating — draining pipeline (deferred)")
+        menuBar?.beginQuitTransition()
+        Task.detached(priority: .userInitiated) { [pipeline] in
             await pipeline.stop()
             await LogShipper.shared.stop()
-            group.leave()
+            await MainActor.run {
+                Log.line("Al: bye")
+                NSApp.reply(toApplicationShouldTerminate: true)
+            }
         }
-        _ = group.wait(timeout: .now() + 5)
-        Log.line("Al: bye")
+        return .terminateLater
     }
 }

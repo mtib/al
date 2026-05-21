@@ -6,18 +6,6 @@ let package = Package(
     platforms: [.macOS(.v15)],
     targets: [
         .target(
-            name: "CRNNoise",
-            path: "Sources/CRNNoise",
-            publicHeadersPath: "include",
-            cSettings: [
-                .headerSearchPath("."),
-                .unsafeFlags([
-                    "-Wno-implicit-function-declaration",
-                    "-Wno-null-dereference",
-                ]),
-            ]
-        ),
-        .target(
             name: "CSherpa",
             path: "Sources/CSherpa",
             publicHeadersPath: "include",
@@ -34,7 +22,7 @@ let package = Package(
         ),
         .executableTarget(
             name: "Al",
-            dependencies: ["CRNNoise", "CSherpa"],
+            dependencies: ["CSherpa"],
             path: "Sources/Al",
             swiftSettings: [
                 .swiftLanguageMode(.v5)

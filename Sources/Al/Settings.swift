@@ -2,13 +2,27 @@ import Foundation
 import SwiftUI
 
 enum ASRModel: String, CaseIterable {
-    case parakeet  = "parakeet"
-    case moonshine = "moonshine"
+    case parakeet110m              = "parakeet110m"
+    case fastConformerMultilingual = "fastConformerMultilingual"
+    case moonshineTiny             = "moonshine"  // kept the raw value for migration
 
     var displayName: String {
         switch self {
-        case .parakeet:  return "Parakeet TDT 0.6B — high quality (~465 MB)"
-        case .moonshine: return "Moonshine Tiny — fast, lighter machines (~45 MB)"
+        case .parakeet110m:
+            return "Parakeet TDT-CTC 110M — English, best quality (~99 MB)"
+        case .fastConformerMultilingual:
+            return "FastConformer CTC — EN/DE/ES/FR multilingual (~98 MB)"
+        case .moonshineTiny:
+            return "Moonshine Tiny — English, smallest footprint (~45 MB)"
+        }
+    }
+
+    /// Two-letter ISO language tags this model can transcribe. Used for UI labelling.
+    var languages: [String] {
+        switch self {
+        case .parakeet110m:              return ["en"]
+        case .fastConformerMultilingual: return ["en", "de", "es", "fr"]
+        case .moonshineTiny:             return ["en"]
         }
     }
 }
@@ -73,7 +87,10 @@ final class Settings: ObservableObject {
         self.serverURL = d.string(forKey: Key.serverURL) ?? ""
         self.psk = d.string(forKey: Key.psk) ?? ""
         self.writeLocally = d.object(forKey: Key.writeLocally) as? Bool ?? true
-        self.asrModel = ASRModel(rawValue: d.string(forKey: Key.asrModel) ?? "") ?? .parakeet
+        // Older builds stored "parakeet" (= 0.6B) — silently migrate to the lighter 110M.
+        let storedASR = d.string(forKey: Key.asrModel) ?? ""
+        self.asrModel = ASRModel(rawValue: storedASR)
+            ?? (storedASR == "parakeet" ? .parakeet110m : .parakeet110m)
         if let existing = d.string(forKey: Key.clientId), !existing.isEmpty {
             self.clientId = existing
         } else {

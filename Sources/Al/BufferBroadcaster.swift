@@ -8,7 +8,7 @@ import AVFoundation
 /// Why this exists: `AsyncStream` is single-consumer, so an audio source
 /// that wants to support multiple readers must hand each one a *fresh*
 /// stream and fan tap callbacks out to every active continuation. Used
-/// by `MicrophoneSource`, `SystemAudioSource`, and `DenoisingAudioSource`.
+/// by `MicSource` and `SystemAudioSource`.
 ///
 /// Thread safety: `emit(_:)` is called from audio threads (CoreAudio tap,
 /// SCK delegate queue, etc.); `stream` is accessed from MainActor or

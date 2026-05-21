@@ -136,6 +136,25 @@ final class MenuBarController: NSObject, NSPopoverDelegate {
 
     private func quit() { NSApplication.shared.terminate(nil) }
 
+    /// Called from `applicationShouldTerminate` so the UI reflects that
+    /// shutdown is in progress while the pipeline drains on a detached task.
+    /// We close the popover (it can't be useful any more), dim the status
+    /// item icon, and overwrite the status label so any subsequent
+    /// "stopped" / "stopping" callbacks from the pipeline don't fight us.
+    func beginQuitTransition() {
+        popover.performClose(nil)
+        if let button = statusItem.button {
+            button.appearsDisabled = true
+            button.toolTip = "Al — quitting…"
+        }
+        model.statusLabel = "Quitting…"
+        model.isRunning = false
+        // Suppress further pipeline status updates so the label doesn't
+        // flicker to "Stopping" / "Stopped" before the process actually exits.
+        pipeline.onStatus = nil
+        pipeline.onUtterance = nil
+    }
+
     // MARK: - Permissions
 
     /// Request both permissions (shows system prompts if not yet determined),

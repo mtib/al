@@ -2,9 +2,9 @@
 
 A minimal, no-Xcode macOS menu-bar app that continuously transcribes the
 microphone and system audio (independently) via sherpa-onnx (Silero VAD +
-NeMo Parakeet TDT 0.6B v3 int8 ASR) and appends the resulting text to a
-rolling log file under `~/Documents/al/`. No translation, no UI transcript, no
-recordings.
+a user-selectable offline ASR model) and appends the resulting text to a
+rolling log file under `~/Documents/al/`. No translation, no recordings.
+The popover shows the last 200 lines but the on-disk file is authoritative.
 
 > **Process rule for future edits**
 >
@@ -29,10 +29,8 @@ recordings.
 
 ```mermaid
 flowchart TD
-    Mic[Mic] --> MicDenoise[RNNoise]
-    Sys[System audio] --> SysDenoise[RNNoise]
-    MicDenoise --> Engine[SherpaEngine<br>Silero VAD per-stream<br>Parakeet TDT 0.6B v3 ASR shared]
-    SysDenoise --> Engine
+    Mic[Mic 48 kHz] --> Engine[SherpaEngine<br>resample to 16 kHz<br>Silero VAD per-stream<br>offline ASR shared, NSLock]
+    Sys[System audio 48 kHz] --> Engine
     Engine --> Writer[TranscriptWriter<br>~/Documents/al/&lt;yyyy-MM-dd&gt;/&lt;stamp&gt;.txt<br>5-min idle rotation]
     Writer -. optional .-> Shipper[LogShipper<br>X25519 sealed-box envelope<br>JSONL outbox + worker loop]
     Shipper -- HTTPS<br>Authorization: Bearer PSK --> Server[server/<br>SQLite + sentence-transformers]
@@ -42,13 +40,25 @@ flowchart TD
 
 Both streams use Silero VAD (sherpa-onnx, 512-sample chunks at 16 kHz):
 - `threshold = 0.5` — speech probability threshold
-- `min_silence_duration = 1.5s` — closes segment after 1.5 s of silence
+- `min_silence_duration = 1.0s` — closes segment after 1 s of silence
 - `min_speech_duration = 0.1s` — ignores noise bursts < 100 ms
+- `max_speech_duration = 30s` — forces a cut on long segments
 
-ASR: NeMo Parakeet TDT 0.6B v3 int8 (ONNX, ~600 MB unpacked), English-only,
-CoreML provider (Metal/ANE acceleration on Apple Silicon). Higher accuracy
-than Moonshine base, ~4× larger model. If CoreML EP throws on an op,
-recognizer init crashes the app at startup — fall back to `provider = "cpu"`
+ASR is offline and VAD-chunked: when Silero closes a segment, the recognizer
+decodes it in one call. The model is user-selectable in Options:
+
+| Model | Languages | Size (int8) | Notes |
+|---|---|---|---|
+| **Parakeet TDT-CTC 110M** *(default)* | EN | ~99 MB | NeMo CTC head, single ONNX file, low bounded RAM, best EN quality. |
+| **FastConformer CTC multilingual** | EN / DE / ES / FR | ~98 MB | NeMo CTC, the only sherpa-onnx-packaged offline model that covers German. |
+| **Moonshine Tiny** | EN | ~45 MB | Smallest footprint; accuracy worst of the three. |
+
+All three load through `SherpaOnnxOfflineRecognizer` with `provider = "coreml"`.
+CTC models share the same code path (`model_config.nemo_ctc.model`); Moonshine
+uses its own four-file config.
+
+If CoreML EP throws an uncatchable C++ exception on an op (`Ort::ThrowOnError`
+→ SIGABRT before any Swift code can catch it), fall back to `provider = "cpu"`
 in `SherpaEngine.preloadModel()` and confirm in `/tmp/al.log`.
 
 ## Files
@@ -68,14 +78,11 @@ in `SherpaEngine.preloadModel()` and confirm in `/tmp/al.log`.
 | `Types.swift` | `SourceTag` (mic/system), `AudioSource` protocol, `Utterance` struct. |
 | `MicSource.swift` | AVAudioEngine mic capture, 48 kHz mono Float32. Auto-restarts on config change. |
 | `SystemAudioSource.swift` | ScreenCaptureKit system audio capture, 48 kHz mono Float32. Exponential-backoff reconnect. |
-| `DenoisingAudioSource.swift` | Wraps any AudioSource, applies RNNoiseProcessor. |
-| `RNNoiseProcessor.swift` | Swift wrapper around vendored xiph/rnnoise v0.1.1. |
-| `BufferBroadcaster.swift` | Fans AVAudioPCMBuffers out to multiple AsyncStream subscribers. |
-| `SherpaEngine.swift` | Silero VAD + Parakeet TDT 0.6B v3 ASR via sherpa-onnx C API. Per-stream VAD, shared ASR model (NSLock). Crosstalk suppression (zeros mic samples when system audio voiced within 250 ms). |
+| `BufferBroadcaster.swift` | Fans AVAudioPCMBuffers out to multiple AsyncStream subscribers. Bounded to 200 buffers per consumer. |
+| `SherpaEngine.swift` | Silero VAD + user-selectable offline ASR via sherpa-onnx C API. Per-stream VAD, shared recognizer (NSLock). Crosstalk suppression (zeros mic samples when system audio voiced within 250 ms, in-place vDSP fill). |
 | `TranscriptWriter.swift` | Swift actor. Appends utterance text to `~/Documents/al/<yyyy-MM-dd>/<stamp>.txt`. Rotates on 5-minute idle gap. When `Settings.writeLocally` is false, skips all disk IO but still returns a stable virtual file_id for the shipper. |
 | `Permissions.swift` | Non-prompting TCC status probes for microphone and screen recording. |
 | `Log.swift` | Append-only logger to `/tmp/al.log`. Truncates on launch if > 5 MB. |
-| `CRNNoise/` | Vendored xiph/rnnoise v0.1.1 (BSD 3-clause). |
 | `CSherpa/` | SwiftPM bridge target linking libsherpa-onnx-c-api.dylib from `build/sherpa-prefix/`. |
 | `../server/` | Optional Python/FastAPI companion server (Dockerized). Stores sealed lines, decrypts on receipt, groups entries into server-side documents by temporal proximity (across all clients), and exposes text + sentence-transformers semantic search. Rotates X25519 keypairs with overlap and a retention window. See `server/README.md`. |
 
@@ -102,8 +109,22 @@ in `SherpaEngine.preloadModel()` and confirm in `/tmp/al.log`.
 
 1. **CoreML provider can throw uncatchable C++ exceptions during recognizer
    init.** `Ort::ThrowOnError` → SIGABRT, before any Swift code can catch it.
-   Stick with `provider = "cpu"` for transducer models like Parakeet unless
-   you've verified every op compiles under CoreML EP.
+   Stick with `provider = "cpu"` for transducer models unless you've verified
+   every op compiles under CoreML EP. The CTC-head models we ship currently
+   (Parakeet TDT-CTC 110M, FastConformer CTC multilingual) are CoreML-clean.
+
+2. **Parakeet TDT 0.6B v3 was not real-time on M1 Air.** The 0.6B
+   encoder-decoder transducer peaked at ~3 GB RSS and fell behind on combined
+   mic + system audio. We dropped it in favour of the 110M CTC variant, which
+   is ~5× smaller and bounded under 1 GB total even with both streams running.
+   If you reintroduce an encoder-decoder model, benchmark on Air first.
+
+3. **NSString lifetime across C calls.** `path as NSString → .utf8String`
+   returns a `char*` whose lifetime is tied to the NSString. ARC will release
+   the NSString as soon as it's out of the immediate expression, leaving
+   sherpa-onnx pointed at freed memory. `preloadModel` keeps an explicit
+   `keepAlive: [NSString]` array that survives until after
+   `SherpaOnnxCreateOfflineRecognizer` returns.
 
 ## Log-shipping protocol
 
